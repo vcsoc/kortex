@@ -1,0 +1,27 @@
+name: Supply Chain Review
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml', '.github/workflows/**', 'web/package*.json']
+permissions:
+  contents: read
+jobs:
+  audit:
+    if: github.event.repository.private == true && vars.KORTEX_PRIVATE_VALIDATION_APPROVED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --all-features --locked check
+      - run: python3 packaging/sbom.py
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dependency-inventory
+          path: target/kortex.cdx.json

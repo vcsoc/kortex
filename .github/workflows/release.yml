@@ -1,0 +1,37 @@
+name: Private Native Validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  artifacts:
+    if: github.event.repository.private == true && vars.KORTEX_PRIVATE_VALIDATION_APPROVED == 'true'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.x'
+      - run: cargo fetch --locked
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo build --release --locked -p kortex-cli --features http
+      - run: python packaging/artifact.py --development
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: kortex-${{ matrix.os }}
+          path: target/artifacts/*
+          if-no-files-found: error
+# Owner policy: proprietary/private, no public use or distribution authorized.
+# This manual job requires BOTH a private repository and separate owner approval.
+# Artifacts are private validation copies, never public releases.

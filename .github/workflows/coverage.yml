@@ -1,0 +1,31 @@
+name: Coverage Gates
+on: [workflow_dispatch, pull_request]
+permissions:
+  contents: read
+jobs:
+  coverage:
+    if: github.event.repository.private == true && vars.KORTEX_PRIVATE_VALIDATION_APPROVED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/coverage-all.lcov --fail-under-lines 80
+      - if: always()
+        run: cargo llvm-cov report --ignore-filename-regex 'kortex-(analysis|cli|config|core|graph|http|indexer|languages|mcp|parse|search)/' --lcov --output-path target/coverage-critical.lcov --fail-under-lines 90
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: coverage
+          path: target/coverage-*.lcov
+# The PRE-WAVE accepted macOS baseline had 90.92% overall and 92.30% critical lines.
+# Current-wave coverage has not been measured; these are not current-source claims.
+# Hosted Linux results remain unverified. The second check reuses full-workspace
+# profiles, including E2E coverage of repository/storage services.

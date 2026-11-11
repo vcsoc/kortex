@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license-file = "LICENSE"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+blake3 = "1.8"
+clap = { version = "4.6", features = ["derive"] }
+toml = "0.9"
+ignore = "0.4"
+rusqlite = { version = "0.42", features = ["bundled"] }
+fs2 = "0.4"
+tempfile = "3"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-go = "0.25"
+kortex-core = { version = "0.1.0", path = "crates/kortex-core" }
+kortex-config = { version = "0.1.0", path = "crates/kortex-config" }
+kortex-repo = { version = "0.1.0", path = "crates/kortex-repo" }
+kortex-parse = { version = "0.1.0", path = "crates/kortex-parse" }
+kortex-languages = { version = "0.1.0", path = "crates/kortex-languages" }
+kortex-graph = { version = "0.1.0", path = "crates/kortex-graph" }
+kortex-storage = { version = "0.1.0", path = "crates/kortex-storage" }
+kortex-search = { version = "0.1.0", path = "crates/kortex-search" }
+kortex-indexer = { version = "0.1.0", path = "crates/kortex-indexer" }
+kortex-analysis = { version = "0.1.0", path = "crates/kortex-analysis" }
+kortex-mcp = { version = "0.1.0", path = "crates/kortex-mcp" }
+kortex-http = { version = "0.1.0", path = "crates/kortex-http" }
+kortex-cli = { version = "0.1.0", path = "crates/kortex-cli" }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

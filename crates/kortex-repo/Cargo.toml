@@ -1,0 +1,42 @@
+[package]
+name = "kortex-repo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+notify = { version = "8.2", default-features = false, features = ["macos_kqueue"] }
+kortex-core.workspace = true
+kortex-config.workspace = true
+ignore.workspace = true
+blake3.workspace = true
+# Existing audited workspace serde/TOML versions; parse explicit data manifests only.
+serde.workspace = true
+toml.workspace = true
+
+# Safe descriptor-relative, no-follow reads close post-canonicalization symlink races.
+# rustix is already audited/locked; MIT OR Apache-2.0 WITH LLVM-exception OR Apache-2.0.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+
+# Bytecode Alliance capability resolver: Windows handle-relative traversal with
+# manually confined reparse resolution; default features exclude networking extras.
+# cap-* license: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT.
+# windows-sys supplies constants only (MIT OR Apache-2.0), no first-party FFI/unsafe.
+[target.'cfg(windows)'.dependencies]
+cap-std = { version = "4.0.3", default-features = false }
+cap-fs-ext = { version = "4.0.3", default-features = false, features = ["std"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Safe, real NTFS junction fixtures, without symlink/admin privilege requirements.
+# MIT; test-only, no production capability or remote service.
+[target.'cfg(windows)'.dev-dependencies]
+junction = { version = "2.1.0", default-features = false }
+
+[lints]
+workspace = true

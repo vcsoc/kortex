@@ -1,0 +1,30 @@
+[package]
+name = "kortex-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+serde_urlencoded = "0.7"
+subtle = "2.6"
+serde.workspace = true
+serde_json.workspace = true
+kortex-core.workspace = true
+kortex-config.workspace = true
+kortex-repo.workspace = true
+kortex-analysis.workspace = true
+kortex-storage.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"
+jsonschema = { version = "0.33", default-features = false }
+tower = { version = "0.5", features = ["util"] }
+tempfile.workspace = true
+kortex-indexer.workspace = true
+
+[lints]
+workspace = true

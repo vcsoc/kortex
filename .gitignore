@@ -1,0 +1,5 @@
+/target/
+.kortex/
+*.db-wal
+*.db-shm
+.pi/history/

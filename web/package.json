@@ -1,0 +1,30 @@
+{
+  "name": "kortex-private-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "playwright test",
+    "format:check": "prettier --check src tests playwright.config.ts"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "cytoscape": "3.35.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "@axe-core/playwright": "4.14.0",
+    "@types/cytoscape": "3.21.9",
+    "@types/node": "22.19.15",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3",
+    "vite": "8.3.8",
+    "prettier": "3.10.0"
+  }
+}

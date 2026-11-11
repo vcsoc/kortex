@@ -1,0 +1,58 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    if: github.event.repository.private == true && vars.KORTEX_PRIVATE_VALIDATION_APPROVED == 'true'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo run -p kortex-cli -- version --json
+      - name: Enforce private proprietary policy
+        run: python -m unittest discover -s packaging -p 'test_*.py'
+      - name: Benchmark harness regression tests (mocked orchestration only)
+        run: python -m unittest discover -s benches -p 'test_*.py'
+      - name: Performance harness self-test (not reference-scale acceptance)
+        run: python benches/acceptance.py --binary target/debug/kortex${{ runner.os == 'Windows' && '.exe' || '' }} --files 4 --functions 3 --search-runs 3 --context-runs 3 --impact-runs 3 --startup-runs 3 --updates 2 --output target/acceptance-harness-selftest.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: acceptance-harness-${{ runner.os }}
+          path: target/acceptance-harness-selftest.json
+  explorer:
+    if: github.event.repository.private == true && vars.KORTEX_PRIVATE_VALIDATION_APPROVED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - run: cargo build --locked -p kortex-cli --features http
+      - run: npm ci --ignore-scripts
+        working-directory: web
+      - run: npm audit --audit-level=low
+        working-directory: web
+      - run: npm run format:check && npm run build
+        working-directory: web
+      - run: npx --no-install playwright install --with-deps chromium
+        working-directory: web
+      - run: npm test
+        working-directory: web

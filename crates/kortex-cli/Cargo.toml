@@ -1,0 +1,39 @@
+[package]
+name = "kortex-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[features]
+default = []
+http = ["dep:kortex-http"]
+
+[dependencies]
+clap_complete = "4.6"
+ctrlc = "3.5"
+kortex-core.workspace = true
+kortex-config.workspace = true
+kortex-repo.workspace = true
+kortex-storage.workspace = true
+kortex-indexer.workspace = true
+kortex-analysis.workspace = true
+kortex-mcp.workspace = true
+kortex-http = { workspace = true, optional = true }
+toml.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "kortex"
+path = "src/main.rs"
+
+[dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-child-process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

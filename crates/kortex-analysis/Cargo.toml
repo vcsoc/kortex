@@ -1,0 +1,30 @@
+[package]
+name = "kortex-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+kortex-core.workspace = true
+kortex-config.workspace = true
+kortex-repo.workspace = true
+kortex-storage.workspace = true
+kortex-search.workspace = true
+kortex-graph.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+kortex-indexer.workspace = true
+jsonschema = { version = "0.33", default-features = false }
+
+[lints]
+workspace = true

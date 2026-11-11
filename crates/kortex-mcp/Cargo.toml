@@ -1,0 +1,22 @@
+[package]
+name = "kortex-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time", "signal", "sync"] }
+kortex-core.workspace = true
+kortex-analysis.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+kortex-indexer.workspace = true
+kortex-config.workspace = true
+
+[lints]
+workspace = true

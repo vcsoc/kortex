@@ -1,0 +1,43 @@
+{
+  "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "python": "3.15.2",
+  "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+  "dataset": {
+    "language": "python",
+    "files": 200,
+    "functions_per_file": 5
+  },
+  "scope": "smoke only; not 100k-symbol/10k-file acceptance, cold cache or correctness evaluation",
+  "version_warm": {
+    "runs": 100,
+    "median_ms": 3.7343124859035015,
+    "p95_ms": 5.019333213567734
+  },
+  "full_index": {
+    "elapsed_ms": 105.89229222387075,
+    "files": 200,
+    "symbols": 1200,
+    "edges": 1800
+  },
+  "query_warm": {
+    "runs": 20,
+    "median_ms": 31.9133335724473,
+    "p95_ms": 42.48829185962677
+  },
+  "context_warm": {
+    "runs": 20,
+    "median_ms": 34.35443760827184,
+    "p95_ms": 46.183958649635315
+  },
+  "impact_warm": {
+    "runs": 20,
+    "median_ms": 31.05093725025654,
+    "p95_ms": 38.719916716217995
+  },
+  "single_file_update": {
+    "elapsed_ms": 132.6463334262371,
+    "parsed": 1,
+    "reused": 199
+  }
+}

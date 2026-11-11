@@ -1,0 +1,23 @@
+[package]
+name = "kortex-indexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+rayon = "1.12"
+kortex-core.workspace = true
+kortex-config.workspace = true
+kortex-repo.workspace = true
+kortex-storage.workspace = true
+kortex-parse.workspace = true
+kortex-languages.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
