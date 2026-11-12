@@ -1,4 +1,5 @@
 //! Transport contracts exercised through the real CLI and rmcp client.
+mod support;
 use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command, time::Duration};
@@ -20,7 +21,7 @@ fn index(root: &Path) {
     );
 }
 fn fixture(budget: usize) -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
+    let root = support::tempdir().unwrap();
     fs::write(root.path().join(".gitignore"), ".kortex/\nregistry.db*\n").unwrap();
     fs::write(
         root.path().join(".kortex.toml"),

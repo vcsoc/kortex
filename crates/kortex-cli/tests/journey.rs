@@ -1,4 +1,5 @@
 //! Production-binary integration tests. Synthetic code is data, never executed.
+mod support;
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command};
 fn binary() -> &'static str {
@@ -21,7 +22,7 @@ fn run(root: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 fn fixture() -> tempfile::TempDir {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     fs::write(d.path().join(".gitignore"), ".kortex/\nregistry.db*\n").unwrap();
     fs::write(
         d.path().join("app.py"),
@@ -289,7 +290,7 @@ fn maintenance_exports_and_owned_data_deletion() {
 }
 #[test]
 fn environment_config_precedence_and_policy() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     fs::write(
         d.path().join(".kortex.toml"),
         "[analysis]\nmax_nodes = 100\n",
@@ -323,7 +324,7 @@ fn environment_config_precedence_and_policy() {
 }
 #[test]
 fn json_errors_and_remote_refusal() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     let out = Command::new(binary())
         .args(["serve", "--host", "0.0.0.0", "--json"])
         .current_dir(d.path())

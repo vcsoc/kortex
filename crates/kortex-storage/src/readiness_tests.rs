@@ -104,7 +104,8 @@ fn migration_failure_rolls_back_and_unrecognized_schema_is_not_adopted() {
     );
     drop(c);
     let other = tempfile::tempdir().unwrap();
-    fs::create_dir(other.path().join(".kortex")).unwrap();
+    crate::test_support::directory(&other.path().join(".kortex")).unwrap();
+    crate::test_support::file(&other.path().join(".kortex/index.db"), b"").unwrap();
     let c = Connection::open(other.path().join(".kortex/index.db")).unwrap();
     c.execute_batch("CREATE TABLE unrelated(secret TEXT); INSERT INTO unrelated VALUES('keep');")
         .unwrap();
@@ -150,13 +151,13 @@ fn actual_sqlite_full_rolls_back_publication_and_restart() {
 fn repair_preserves_original_sidecars_ownership_and_never_source_or_config() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path().join(".kortex");
-    fs::create_dir(&dir).unwrap();
+    crate::test_support::directory(&dir).unwrap();
     fs::write(d.path().join("source.rs"), "fn source(){}").unwrap();
     fs::write(d.path().join(".kortex.toml"), "schema_version=1").unwrap();
     fs::write(dir.join("config.toml"), "retain=true").unwrap();
     fs::write(dir.join("index.db.bak"), "previous backup").unwrap();
     for name in ["index.db", "index.db-wal", "index.db-shm"] {
-        fs::write(dir.join(name), format!("original evidence {name}")).unwrap();
+        crate::test_support::file(&dir.join(name), format!("original evidence {name}")).unwrap();
     }
     #[cfg(unix)]
     let before: Vec<_> = {

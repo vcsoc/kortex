@@ -1,4 +1,5 @@
 //! CLI integration of the persistence owner's public workspace and preservation APIs.
+mod support;
 use serde_json::Value;
 use std::{fs, path::Path, process::Command};
 fn command(root: &Path) -> Command {
@@ -9,7 +10,7 @@ fn command(root: &Path) -> Command {
 }
 #[test]
 fn explicit_workspace_indexes_real_repositories_and_deduplicates() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     for repo in ["one", "two"] {
         fs::create_dir(d.path().join(repo)).unwrap();
         fs::write(
@@ -54,7 +55,7 @@ fn explicit_workspace_indexes_real_repositories_and_deduplicates() {
 }
 #[test]
 fn relocated_effective_root_is_indexed_once_and_read_with_original_config() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     let root = d.path();
     fs::create_dir(root.join("src")).unwrap();
     fs::write(root.join("src/app.py"), "def inside():\n    pass\n").unwrap();
@@ -116,10 +117,16 @@ fn relocated_effective_root_is_indexed_once_and_read_with_original_config() {
 }
 #[test]
 fn user_cache_index_status_and_owned_deletion_use_the_same_configured_store() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     let root = d.path();
     let cache = root.join("private-cache");
-    fs::create_dir(&cache).unwrap();
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&cache).unwrap();
     fs::write(root.join(".gitignore"), "private-cache/\nregistry.db*\n").unwrap();
     fs::write(root.join("app.py"), "def entry():\n    pass\n").unwrap();
     fs::write(root.join(".kortex.toml"), "[index]\nstorage='user-cache'\n").unwrap();
@@ -171,7 +178,7 @@ fn user_cache_index_status_and_owned_deletion_use_the_same_configured_store() {
 }
 #[test]
 fn doctor_repair_preserves_actual_corrupt_bytes_and_rebuilds() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     fs::write(d.path().join("app.py"), "def entry():\n    pass\n").unwrap();
     let out = command(d.path())
         .args(["index", ".", "--json"])

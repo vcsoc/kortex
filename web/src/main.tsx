@@ -142,6 +142,7 @@ function App() {
   const [refresh, setRefresh] = useState(0);
   const [tab, setTab] = useState<Tab>("Explore");
   const [depth, setDepth] = useState(2);
+  const [nodeLimit, setNodeLimit] = useState(200);
   const [direction, setDirection] = useState("upstream");
   const [impact, setImpact] = useState<Envelope<
     Record<string, unknown>
@@ -325,7 +326,7 @@ function App() {
         const neighborhood = await api.request<Graph>(`/repos/${repo}/graph`, {
           symbol: id,
           depth,
-          max_nodes: 200,
+          max_nodes: nodeLimit,
           ...pinned(),
         });
         return { detail, neighborhood };
@@ -345,7 +346,7 @@ function App() {
         symbol: context.data.symbol.symbol_id,
         direction,
         depth,
-        max_nodes: 200,
+        max_nodes: nodeLimit,
         ...pinned(),
       }),
     );
@@ -359,7 +360,7 @@ function App() {
           ? { ...(base ? { base } : {}), ...(head ? { head } : {}) }
           : { [diffMode]: true }),
         depth,
-        max_nodes: 200,
+        max_nodes: nodeLimit,
         ...pinned(),
       }),
     );
@@ -373,7 +374,7 @@ function App() {
         {
           limit: 20,
           depth,
-          max_nodes: 200,
+          max_nodes: nodeLimit,
           include_processes: true,
           ...pinned(),
           ...(cursor ? { cursor } : {}),
@@ -712,6 +713,21 @@ function App() {
                       onChange={(e) =>
                         setDepth(
                           Math.max(0, Math.min(4, Number(e.target.value))),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Maximum traversal nodes
+                    <input
+                      aria-label="Maximum traversal nodes"
+                      type="number"
+                      min={1}
+                      max={200}
+                      value={nodeLimit}
+                      onChange={(e) =>
+                        setNodeLimit(
+                          Math.max(1, Math.min(200, Number(e.target.value))),
                         )
                       }
                     />

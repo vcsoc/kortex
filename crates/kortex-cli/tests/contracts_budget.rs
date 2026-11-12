@@ -1,11 +1,12 @@
 //! A byte-limited result must remain usable through the actual MCP client.
+mod support;
 use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, fs, process::Command, time::Duration};
 
 #[tokio::test]
 async fn byte_truncated_pages_keep_all_hits_and_opaque_cursors() {
-    let root = tempfile::tempdir().unwrap();
+    let root = support::tempdir().unwrap();
     fs::write(root.path().join(".gitignore"), ".kortex/\nregistry.db*\n").unwrap();
     fs::write(
         root.path().join(".kortex.toml"),

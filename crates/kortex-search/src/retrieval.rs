@@ -1,10 +1,10 @@
 //! Explicit local-only retrieval with native-provider vectors and weighted RRF.
 use crate::{
     Filters, Hit,
-    hybrid::{EmbeddingCache, LocalEmbedder, RankingWeights, reciprocal_rank_fusion},
-    query_filtered,
+    hybrid::{EmbeddingCache, LocalEmbedder, RankingWeights, reciprocal_rank_fusion_with_control},
+    query_filtered_with_control, sort_with_control,
 };
-use kortex_core::{Error, Result, Snapshot};
+use kortex_core::{Error, RequestControl, Result, Snapshot};
 use kortex_storage::Store;
 use serde::Serialize;
 use std::{
@@ -76,7 +76,25 @@ pub fn query_hybrid(
     cache: &mut EmbeddingCache,
     options: &HybridOptions<'_>,
 ) -> Result<HybridResult> {
-    checkpoint(options)?;
+    let control = RequestControl::from_deadline(options.deadline);
+    query_hybrid_with_control(store, snapshot, text, provider, cache, options, &control)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn query_hybrid_with_control(
+    store: &Store,
+    snapshot: &Snapshot,
+    text: &str,
+    provider: &mut dyn LocalEmbedder,
+    cache: &mut EmbeddingCache,
+    options: &HybridOptions<'_>,
+    control: &RequestControl,
+) -> Result<HybridResult> {
+    let control = control.restrict_deadline(options.deadline);
+    let checkpoint = || {
+        control.check()?;
+        checkpoint(options)
+    };
+    checkpoint()?;
     if !(1..=10000).contains(&options.max_candidates)
         || !(1..=500).contains(&options.limit)
         || options.offset > 100000
@@ -87,25 +105,34 @@ pub fn query_hybrid(
             2,
         ));
     }
-    reciprocal_rank_fusion(&[], &[], options.weights)?;
-    let (lexical, _) = query_filtered(store, snapshot, text, 500, 0, &options.filters)?;
-    checkpoint(options)?;
+    reciprocal_rank_fusion_with_control(&[], &[], options.weights, &control)?;
+    let (lexical, _) =
+        query_filtered_with_control(store, snapshot, text, 500, 0, &options.filters, &control)?;
+    checkpoint()?;
     let query = cache.get_or_embed(provider, text)?;
-    let mut documents = snapshot
-        .symbols()
-        .filter(|s| options.filters.matches(s))
-        .collect::<Vec<_>>();
-    documents.sort_by(|a, b| {
-        a.file_path
-            .cmp(&b.file_path)
-            .then(a.span.start_byte.cmp(&b.span.start_byte))
-            .then(a.symbol_id.cmp(&b.symbol_id))
-    });
+    checkpoint()?;
+    let mut documents = vec![];
+    for symbol in snapshot.symbols() {
+        checkpoint()?;
+        if options.filters.matches(symbol) {
+            documents.push(symbol);
+        }
+    }
+    sort_with_control(
+        &mut documents,
+        |a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.span.start_byte.cmp(&b.span.start_byte))
+                .then(a.symbol_id.cmp(&b.symbol_id))
+        },
+        &control,
+    )?;
     let partial = documents.len() > options.max_candidates;
     documents.truncate(options.max_candidates);
     let mut vector = vec![];
     for symbol in &documents {
-        checkpoint(options)?;
+        checkpoint()?;
         let content = format!(
             "{} {}\n{}\n{}\n{}",
             symbol.language,
@@ -125,14 +152,19 @@ pub fn query_hybrid(
             .sum::<f64>();
         vector.push((symbol.symbol_id.clone(), similarity));
     }
-    checkpoint(options)?;
-    vector.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    checkpoint()?;
+    sort_with_control(
+        &mut vector,
+        |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)),
+        &control,
+    )?;
     let lexical_ids = lexical
         .iter()
         .map(|h| h.symbol.symbol_id.clone())
         .collect::<Vec<_>>();
     let vector_ids = vector.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-    let fused = reciprocal_rank_fusion(&lexical_ids, &vector_ids, options.weights)?;
+    let fused =
+        reciprocal_rank_fusion_with_control(&lexical_ids, &vector_ids, options.weights, &control)?;
     let more = fused.len() > options.offset.saturating_add(options.limit);
     let lexical_by_id = lexical
         .into_iter()
@@ -163,7 +195,7 @@ pub fn query_hybrid(
             })
         })
         .collect();
-    checkpoint(options)?;
+    checkpoint()?;
     Ok(HybridResult {
         items,
         more,

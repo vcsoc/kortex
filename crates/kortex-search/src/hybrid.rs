@@ -1,7 +1,7 @@
 //! Opt-in local embedding integration contracts. No bundled model, downloads or remote provider.
 //! This module supplies artifact verification, a bounded content/model cache and RRF;
 //! it does NOT pretend keyword hashes are neural model inference.
-use kortex_core::{Error, Result, hash, id};
+use kortex_core::{Error, RequestControl, Result, hash, id};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -10,13 +10,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
     pub path: PathBuf,
     pub blake3: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalModelManifest {
     pub schema_version: String,
@@ -47,6 +47,24 @@ impl VerifiedModel {
 fn invalid(message: &str) -> Error {
     Error::new("INVALID_LOCAL_MODEL", message, 2)
 }
+pub(crate) fn open_artifact(path: &Path) -> Result<File> {
+    #[cfg(not(unix))]
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(invalid("artifact must be a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("artifact must be a regular file"));
+    }
+    Ok(file)
+}
 fn verify_artifact(artifact: &Artifact, max_bytes: u64) -> Result<()> {
     if !artifact.path.is_absolute()
         || artifact.blake3.len() != 64
@@ -59,7 +77,7 @@ fn verify_artifact(artifact: &Artifact, max_bytes: u64) -> Result<()> {
             "artifact requires an explicit absolute local path and lowercase BLAKE3 checksum",
         ));
     }
-    let mut file = File::open(&artifact.path)?;
+    let mut file = open_artifact(&artifact.path)?;
     if !file.metadata()?.is_file() || file.metadata()?.len() > max_bytes {
         return Err(invalid(
             "artifact exceeds size policy or is not a regular file",
@@ -83,6 +101,22 @@ fn verify_artifact(artifact: &Artifact, max_bytes: u64) -> Result<()> {
         return Err(invalid("artifact checksum mismatch"));
     }
     Ok(())
+}
+/// Read an explicitly configured, checksummed manifest. Never discovers models or downloads.
+pub fn read_manifest(path: &Path, checksum: &str) -> Result<LocalModelManifest> {
+    let artifact = Artifact {
+        path: path.into(),
+        blake3: checksum.into(),
+    };
+    verify_artifact(&artifact, 1024 * 1024)?;
+    let mut bytes = vec![];
+    open_artifact(path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 || hash(&bytes) != checksum {
+        return Err(invalid("manifest changed or checksum mismatch during load"));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::new("INVALID_LOCAL_MODEL", e.to_string(), 2))
 }
 /// Verifies bytes, not architecture support or legal approval; inference adapters must
 /// revalidate/check the same bytes at load to prevent artifact replacement races.
@@ -126,23 +160,58 @@ pub fn verify_model(manifest: LocalModelManifest) -> Result<VerifiedModel> {
 /// no provider is auto-created from repository configuration and none is bundled here.
 pub trait LocalEmbedder {
     fn model(&self) -> &VerifiedModel;
+    /// Implementations must change this on inference/tokenization algorithm changes.
+    fn cache_namespace(&self) -> &str {
+        "local-embedder-v1"
+    }
     fn embed(&mut self, text: &str) -> Result<Vec<f32>>;
 }
+/// Storage adapter contract. Keys contain only hashes; source text is never persisted.
+/// Implementations must enforce private placement, bounded capacity and crash-safe writes.
+pub trait VectorPersistence: Send {
+    fn get(
+        &mut self,
+        model_key: &str,
+        content_hash: &str,
+        dimensions: usize,
+    ) -> Result<Option<Vec<f32>>>;
+    fn put(&mut self, model_key: &str, content_hash: &str, vector: &[f32]) -> Result<()>;
+}
 pub struct EmbeddingCache {
+    persistence: Option<Box<dyn VectorPersistence>>,
     capacity: usize,
+    byte_budget: usize,
+    bytes: usize,
     values: BTreeMap<String, Vec<f32>>,
     order: VecDeque<String>,
 }
 impl EmbeddingCache {
     pub fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 || capacity > 100_000 {
-            return Err(invalid("cache capacity must be 1..100000"));
+        Self::with_memory_limit(capacity, 64 * 1024 * 1024)
+    }
+    pub fn with_memory_limit(capacity: usize, byte_budget: usize) -> Result<Self> {
+        if capacity == 0 || capacity > 100_000 || !(16..=64 * 1024 * 1024).contains(&byte_budget) {
+            return Err(invalid(
+                "cache capacity must be 1..100000 and vector budget 16 bytes..64 MiB",
+            ));
         }
         Ok(Self {
+            persistence: None,
             capacity,
+            byte_budget,
+            bytes: 0,
             values: BTreeMap::new(),
             order: VecDeque::new(),
         })
+    }
+    /// Explicit storage opt-in; never opens a path or enables uploads itself.
+    pub fn with_persistence(
+        capacity: usize,
+        persistence: Box<dyn VectorPersistence>,
+    ) -> Result<Self> {
+        let mut cache = Self::new(capacity)?;
+        cache.persistence = Some(persistence);
+        Ok(cache)
     }
     pub fn get_or_embed(
         &mut self,
@@ -152,11 +221,25 @@ impl EmbeddingCache {
         if text.len() > 65536 {
             return Err(invalid("embedding input exceeds 64 KiB"));
         }
-        let key = id(&[provider.model().fingerprint(), &hash(text)]);
+        let model_key = id(&[provider.cache_namespace(), provider.model().fingerprint()]);
+        let content_hash = hash(text);
+        let key = id(&[&model_key, &content_hash]);
         if let Some(value) = self.values.get(&key) {
             return Ok(value.clone());
         }
-        let mut value = provider.embed(text)?;
+        let persisted = match &mut self.persistence {
+            Some(storage) => storage.get(
+                &model_key,
+                &content_hash,
+                provider.model().manifest().dimensions,
+            )?,
+            None => None,
+        };
+        let cache_hit = persisted.is_some();
+        let mut value = match persisted {
+            Some(value) => value,
+            None => provider.embed(text)?,
+        };
         if value.len() != provider.model().manifest().dimensions
             || value.iter().any(|v| !v.is_finite())
         {
@@ -169,17 +252,31 @@ impl EmbeddingCache {
             .map(|v| (*v as f64).powi(2))
             .sum::<f64>()
             .sqrt();
-        if norm <= f64::EPSILON {
-            return Err(invalid("model returned a zero vector"));
+        if norm <= f64::EPSILON || (cache_hit && (norm - 1.0).abs() > 1e-3) {
+            return Err(invalid(
+                "model/cache returned a zero or nonnormalized vector",
+            ));
         }
         for v in &mut value {
             *v = (*v as f64 / norm) as f32;
         }
-        while self.values.len() >= self.capacity {
+        if !cache_hit && let Some(storage) = &mut self.persistence {
+            storage.put(&model_key, &content_hash, &value)?;
+        }
+        let bytes = value.len() * std::mem::size_of::<f32>();
+        if bytes > self.byte_budget {
+            return Ok(value);
+        }
+        while self.values.len() >= self.capacity || self.bytes + bytes > self.byte_budget {
             if let Some(old) = self.order.pop_front() {
-                self.values.remove(&old);
+                if let Some(value) = self.values.remove(&old) {
+                    self.bytes -= value.len() * std::mem::size_of::<f32>();
+                }
+            } else {
+                break;
             }
         }
+        self.bytes += bytes;
         self.order.push_back(key.clone());
         self.values.insert(key, value.clone());
         Ok(value)
@@ -215,6 +312,16 @@ pub fn reciprocal_rank_fusion(
     vector: &[String],
     weights: RankingWeights,
 ) -> Result<Vec<FusedHit>> {
+    let control = RequestControl::new(std::time::Duration::from_secs(10))?;
+    reciprocal_rank_fusion_with_control(lexical, vector, weights, &control)
+}
+pub fn reciprocal_rank_fusion_with_control(
+    lexical: &[String],
+    vector: &[String],
+    weights: RankingWeights,
+    control: &RequestControl,
+) -> Result<Vec<FusedHit>> {
+    control.check()?;
     if !weights.lexical.is_finite()
         || !weights.vector.is_finite()
         || !weights.rank_constant.is_finite()
@@ -241,6 +348,7 @@ pub fn reciprocal_rank_fusion(
         }
         let mut seen = BTreeSet::new();
         for (rank, id) in list.iter().enumerate() {
+            control.check()?;
             if !seen.insert(id) {
                 continue;
             }
@@ -259,11 +367,15 @@ pub fn reciprocal_rank_fusion(
         }
     }
     let mut hits = hits.into_values().collect::<Vec<_>>();
-    hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.symbol_id.cmp(&b.symbol_id))
-    });
+    crate::sort_with_control(
+        &mut hits,
+        |a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.symbol_id.cmp(&b.symbol_id))
+        },
+        control,
+    )?;
     Ok(hits)
 }
 #[derive(Debug, Serialize)]
@@ -337,6 +449,23 @@ pub fn manifest_artifact(path: &Path, checksum: &str) -> Artifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn artifact_fifo_and_directories_are_refused_without_blocking_or_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("model.fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(open_artifact(&fifo).is_err());
+        assert!(read_manifest(&fifo, &"0".repeat(64)).is_err());
+        assert!(open_artifact(temp.path()).is_err());
+        assert!(fifo.exists());
+    }
     #[test]
     fn rrf_weights_duplicates_and_curated_metric_arithmetic() {
         let names = |s: &[&str]| s.iter().map(|s| (*s).into()).collect::<Vec<String>>();

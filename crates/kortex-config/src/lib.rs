@@ -20,6 +20,23 @@ pub struct Config {
     pub search: Search,
     pub mcp: Mcp,
     pub http: Http,
+    /// Selection context only: never configuration input, serialized output, or a fingerprint.
+    #[serde(skip)]
+    pub origin: Option<SelectionOrigin>,
+    /// Runtime resolution context, excluded from input/output. The configured root
+    /// spelling stays visible while semantic fingerprints retain the resolved root.
+    #[serde(skip)]
+    pub root_selection: Option<RootSelection>,
+}
+#[derive(Debug, Clone)]
+pub struct RootSelection {
+    pub configured: String,
+    pub resolved: PathBuf,
+}
+#[derive(Debug, Clone)]
+pub struct SelectionOrigin {
+    pub invocation_root: PathBuf,
+    pub explicit_config: Option<PathBuf>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -159,6 +176,8 @@ impl Default for Config {
             search: Search::default(),
             mcp: Mcp::default(),
             http: Http::default(),
+            origin: None,
+            root_selection: None,
         }
     }
 }
@@ -185,7 +204,20 @@ pub fn user_config_path() -> Option<PathBuf> {
 }
 impl Config {
     pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Self> {
+        let invocation_root = root.canonicalize()?;
+        let explicit_config = explicit
+            .map(|path| -> Result<PathBuf> {
+                Ok(if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    env::current_dir()?.join(path)
+                })
+            })
+            .transpose()?;
+        let root = invocation_root.as_path();
+        let explicit = explicit_config.as_deref();
         let mut value = toml::Value::try_from(Self::default()).map_err(config_error)?;
+        let mut root_selection = None;
         for (path, trusted) in [
             (user_config_path(), true),
             (
@@ -236,6 +268,10 @@ impl Config {
                                 8,
                             ));
                         }
+                        root_selection = Some(RootSelection {
+                            configured: relative.to_owned(),
+                            resolved: target.clone(),
+                        });
                         *field = toml::Value::String(
                             target
                                 .to_str()
@@ -258,6 +294,9 @@ impl Config {
                 .split("__")
                 .map(str::to_lowercase)
                 .collect();
+            if parts == ["repository", "root"] {
+                root_selection = None;
+            }
             let mut field = &mut value;
             for part in parts {
                 field = field.get_mut(&part).ok_or_else(|| {
@@ -284,7 +323,15 @@ impl Config {
         if let Ok(v) = env::var("KORTEX_INCLUDE_HIDDEN") {
             config.repository.include_hidden = v.parse().map_err(config_error)?;
         }
+        if let Some(selection) = &root_selection {
+            config.repository.root = selection.configured.clone();
+        }
+        config.root_selection = root_selection;
         config.validate()?;
+        config.origin = Some(SelectionOrigin {
+            invocation_root,
+            explicit_config,
+        });
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
@@ -344,7 +391,12 @@ impl Config {
     /// Resolve a configured relocation without running Git or executing repository code.
     /// Config::load already confines repository-supplied roots; trusted callers may use absolute roots.
     pub fn resolved_root(&self, base: &Path) -> Result<PathBuf> {
-        let target = base.join(&self.repository.root).canonicalize()?;
+        let target = match &self.root_selection {
+            Some(selection) if selection.configured == self.repository.root => {
+                selection.resolved.canonicalize()?
+            }
+            _ => base.join(&self.repository.root).canonicalize()?,
+        };
         if !target.is_dir() || target.to_str().is_none() {
             return Err(config_error(
                 "repository.root must resolve to a UTF-8 directory",
@@ -353,6 +405,18 @@ impl Config {
         Ok(target)
     }
     pub fn fingerprint(&self) -> Result<String> {
+        if let Some(selection) = &self.root_selection
+            && selection.configured == self.repository.root
+        {
+            // Match the pre-display-fix canonical-root fingerprint byte for byte.
+            let mut semantic = self.clone();
+            semantic.repository.root = selection
+                .resolved
+                .to_str()
+                .ok_or_else(|| config_error("root must be UTF-8"))?
+                .into();
+            return Ok(kortex_core::hash(serde_json::to_vec(&semantic)?));
+        }
         Ok(kortex_core::hash(serde_json::to_vec(self)?))
     }
 }

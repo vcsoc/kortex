@@ -1,10 +1,36 @@
 //! Confined repository discovery and read-only Git inspection.
 mod confined;
+mod reader;
+#[cfg(test)]
+mod reader_tests;
+pub use reader::{ConfinedReadStats, ConfinedReader};
+pub mod experimental;
 pub mod inputs;
+pub mod placement;
 pub mod watch;
 pub mod workspace;
 use kortex_config::Config;
-use kortex_core::{Error, Result, hash, public_path};
+use kortex_core::{Error, RequestControl, Result, hash, public_path};
+
+pub(crate) fn checkpoint(control: Option<&RequestControl>) -> Result<()> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn hash_controlled(bytes: &[u8], control: Option<&RequestControl>) -> Result<String> {
+    let Some(control) = control else {
+        return Ok(hash(bytes));
+    };
+    let mut hasher = blake3::Hasher::new();
+    for chunk in bytes.chunks(64 * 1024) {
+        control.check()?;
+        hasher.update(chunk);
+    }
+    control.check()?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
 #[cfg(test)]
 use std::fs;
 use std::{
@@ -88,7 +114,28 @@ pub fn language(path: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-pub fn read_confined(root: &Path, relative: &str, max: u64) -> Result<String> {
+/// Read bounded bytes through the same descriptor-relative confinement used for source.
+///
+/// `root` must be canonical and trusted at acquisition. Binary data is allowed;
+/// use [`read_confined`] for source-text validation. No ambient file-open fallback.
+pub fn read_confined_bytes(root: &Path, relative: &str, max: u64) -> Result<Vec<u8>> {
+    let path = resolve_confined(root, relative)?;
+    confined::read_bytes(root, &path, max)
+}
+
+/// Bounded confined bytes with cooperative checkpoints between actual read chunks.
+pub fn read_confined_bytes_with_control(
+    root: &Path,
+    relative: &str,
+    max: u64,
+    control: &RequestControl,
+) -> Result<Vec<u8>> {
+    control.check()?;
+    let path = resolve_confined(root, relative)?;
+    confined::read_bytes_with_control(root, &path, max, Some(control))
+}
+
+fn resolve_confined(root: &Path, relative: &str) -> Result<PathBuf> {
     let input = Path::new(relative);
     if input.is_absolute()
         || input
@@ -105,32 +152,76 @@ pub fn read_confined(root: &Path, relative: &str, max: u64) -> Result<String> {
     if !path.starts_with(root) {
         return Err(Error::new("PATH_REFUSED", "symlink escapes repository", 8));
     }
-    let file = confined::open(root, &path)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::new("PATH_REFUSED", "not a regular file", 8));
-    }
-    let mut bytes = Vec::new();
-    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        return Err(Error::new(
-            "FILE_TOO_LARGE",
-            "file exceeds configured size limit",
-            7,
-        ));
-    }
+    Ok(path)
+}
+/// Read confined UTF-8 source text, preserving binary/encoding diagnostics.
+pub fn read_confined(root: &Path, relative: &str, max: u64) -> Result<String> {
+    let bytes = read_confined_bytes(root, relative, max)?;
     if bytes.contains(&0) {
         return Err(Error::new("BINARY_FILE", "binary file", 7));
     }
     String::from_utf8(bytes).map_err(|_| Error::new("INVALID_ENCODING", "not UTF-8", 7))
 }
+/// Confined text read sharing the request cancellation/deadline.
+pub fn read_confined_with_control(
+    root: &Path,
+    relative: &str,
+    max: u64,
+    control: &RequestControl,
+) -> Result<String> {
+    let bytes = read_confined_bytes_with_control(root, relative, max, control)?;
+    if bytes.contains(&0) {
+        return Err(Error::new("BINARY_FILE", "binary file", 7));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::new("INVALID_ENCODING", "not UTF-8", 7))
+}
+
 pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
+    discover_impl(root, config, None)
+}
+
+/// Cancellation/timeout aborts the inventory, never becomes a skipped-file diagnostic.
+pub fn discover_with_control(
+    root: &Path,
+    config: &Config,
+    control: &RequestControl,
+) -> Result<Inventory> {
+    discover_impl(root, config, Some(control))
+}
+
+fn discover_impl(
+    root: &Path,
+    config: &Config,
+    control: Option<&RequestControl>,
+) -> Result<Inventory> {
+    checkpoint(control)?;
+    let mut reader = ConfinedReader::new(root)?;
+    let inventory = discover_using(root, config, control, |canonical, _path| {
+        reader
+            .read_resolved(canonical, config.repository.max_file_size_bytes, control)
+            .and_then(reader::text)
+    })?;
+    // Also bind an empty/unsupported-only inventory to the acquired root.
+    reader.validate(control)?;
+    Ok(inventory)
+}
+
+fn discover_using(
+    root: &Path,
+    config: &Config,
+    control: Option<&RequestControl>,
+    mut read: impl FnMut(&Path, &str) -> Result<String>,
+) -> Result<Inventory> {
+    checkpoint(control)?;
     let mut overrides = ignore::overrides::OverrideBuilder::new(root);
     for pattern in &config.repository.include {
+        checkpoint(control)?;
         overrides
             .add(pattern)
             .map_err(|e| Error::new("INVALID_GLOB", e.to_string(), 2))?;
     }
     for pattern in &config.repository.exclude {
+        checkpoint(control)?;
         overrides
             .add(&format!("!{pattern}"))
             .map_err(|e| Error::new("INVALID_GLOB", e.to_string(), 2))?;
@@ -139,12 +230,16 @@ pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
         .build()
         .map_err(|e| Error::new("INVALID_GLOB", e.to_string(), 2))?;
     let mut builder = ignore::WalkBuilder::new(root);
+    let walk_control = control.cloned();
     builder
         .hidden(!config.repository.include_hidden)
         .follow_links(config.repository.follow_symlinks)
         .add_custom_ignore_filename(".kortexignore")
         .overrides(overrides)
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
+            if walk_control.as_ref().is_some_and(|c| c.check().is_err()) {
+                return false;
+            }
             ![
                 ".git",
                 ".kortex",
@@ -170,8 +265,9 @@ pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
     let mut case_paths = std::collections::BTreeMap::<String, String>::new();
     // A case-insensitive checkout cannot hold both spellings, but Git's index can.
     // Inspect names only; ls-files never runs clean filters or repository code.
-    if let Ok(tracked) = git(root, &["ls-files", "--cached", "-z"]) {
+    if let Ok(tracked) = git_impl(root, &["ls-files", "--cached", "-z"], control) {
         for path in tracked.split('\0').filter(|path| !path.is_empty()) {
+            checkpoint(control)?;
             if let Some(previous) = case_paths.insert(path.to_lowercase(), path.to_owned())
                 && previous != path
             {
@@ -188,6 +284,7 @@ pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
     case_paths.clear();
     let mut considered = 0;
     for entry in builder.build() {
+        checkpoint(control)?;
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -255,10 +352,12 @@ pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
             ));
         }
         // A skipped alias must not consume the canonical source's dedup slot.
-        if !seen.insert(canonical) {
+        if !seen.insert(canonical.clone()) {
             continue;
         }
-        match read_confined(root, &path, config.repository.max_file_size_bytes) {
+        let read = read(&canonical, &path);
+        checkpoint(control)?;
+        match read {
             Ok(source) => {
                 total_bytes += source.len() as u64;
                 if total_bytes > config.repository.max_total_bytes {
@@ -267,7 +366,9 @@ pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
                         .push("max_total_bytes reached; inventory truncated".into());
                     break;
                 }
-                let content_hash = hash(&source);
+                checkpoint(control)?;
+                let content_hash = hash_controlled(source.as_bytes(), control)?;
+                checkpoint(control)?;
                 inventory.files.push(SourceFile {
                     path,
                     source,
@@ -277,11 +378,23 @@ pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
             Err(e) => inventory.diagnostics.push(format!("{path}: {e}")),
         }
     }
+    checkpoint(control)?;
     inventory.files.sort_by(|a, b| a.path.cmp(&b.path));
     inventory.diagnostics.sort();
+    checkpoint(control)?;
     Ok(inventory)
 }
 pub fn git(root: &Path, args: &[&str]) -> Result<String> {
+    git_impl(root, args, None)
+}
+
+/// Trusted Git subprocess with shared cancellation/deadline polling.
+pub fn git_with_control(root: &Path, args: &[&str], control: &RequestControl) -> Result<String> {
+    git_impl(root, args, Some(control))
+}
+
+fn git_impl(root: &Path, args: &[&str], control: Option<&RequestControl>) -> Result<String> {
+    checkpoint(control)?;
     const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
     let mut child = Command::new("git")
         .arg("--no-pager")
@@ -300,10 +413,24 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String> {
         .spawn()?;
     fn collect(
         reader: impl Read + Send + 'static,
-    ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+        control: Option<RequestControl>,
+    ) -> std::thread::JoinHandle<Result<Vec<u8>>> {
         std::thread::spawn(move || {
+            let mut reader = reader.take(OUTPUT_LIMIT + 1);
             let mut bytes = vec![];
-            reader.take(OUTPUT_LIMIT + 1).read_to_end(&mut bytes)?;
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                checkpoint(control.as_ref())?;
+                let count = match reader.read(&mut chunk) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                checkpoint(control.as_ref())?;
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
             Ok(bytes)
         })
     }
@@ -312,19 +439,21 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String> {
             .stdout
             .take()
             .ok_or_else(|| Error::new("GIT_ERROR", "missing stdout", 1))?,
+        control.cloned(),
     );
     let stderr = collect(
         child
             .stderr
             .take()
             .ok_or_else(|| Error::new("GIT_ERROR", "missing stderr", 1))?,
+        control.cloned(),
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if std::time::Instant::now() > deadline {
+        if checkpoint(control).is_err() || std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -333,10 +462,13 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String> {
     };
     let out = stdout
         .join()
-        .map_err(|_| Error::new("GIT_ERROR", "stdout reader panicked", 1))??;
+        .map_err(|_| Error::new("GIT_ERROR", "stdout reader panicked", 1))?;
     let err = stderr
         .join()
-        .map_err(|_| Error::new("GIT_ERROR", "stderr reader panicked", 1))??;
+        .map_err(|_| Error::new("GIT_ERROR", "stderr reader panicked", 1))?;
+    checkpoint(control)?;
+    let out = out?;
+    let err = err?;
     let status = status.ok_or_else(|| Error::new("GIT_TIMEOUT", "Git exceeded five seconds", 9))?;
     if out.len() as u64 > OUTPUT_LIMIT || err.len() as u64 > OUTPUT_LIMIT {
         return Err(Error::new(
@@ -367,7 +499,11 @@ pub fn head(root: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+mod byte_tests;
+#[cfg(test)]
 mod confinement_tests;
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod filename_tests;
 #[cfg(test)]

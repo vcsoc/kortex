@@ -3,64 +3,87 @@ use crate::Service;
 use kortex_core::{Error, Result, hash};
 use serde_json::{Value, json};
 
-fn fingerprint(service: &Service, operation: &str, args: &Value) -> String {
-    let mut request = args.clone();
-    if let Some(map) = request.as_object_mut() {
-        for key in [
-            "cursor",
-            "limit",
-            "max_response_bytes",
-            "timeout_ms",
-            "require_fresh",
-        ] {
-            map.remove(key);
+pub(crate) struct CursorContext<'a> {
+    pub repo_id: &'a str,
+    pub generation_id: &'a str,
+    pub config: &'a kortex_config::Config,
+}
+impl<'a> From<&'a Service> for CursorContext<'a> {
+    fn from(service: &'a Service) -> Self {
+        Self {
+            repo_id: &service.snapshot.repo_id,
+            generation_id: &service.snapshot.generation_id,
+            config: &service.config,
         }
     }
-    hash(
-        serde_json::to_vec(&json!([
-            service.snapshot.repo_id,
-            service.snapshot.generation_id,
-            operation,
-            request
-        ]))
-        .unwrap_or_default(),
-    )
 }
-pub fn cursor(service: &Service, operation: &str, args: &Value, offset: usize) -> String {
-    format!("kx1.{}.{offset}", fingerprint(service, operation, args))
-}
-pub fn cursor_offset(service: &Service, operation: &str, args: &Value) -> Result<usize> {
-    let invalid = || {
-        Error::new(
-            "INVALID_CURSOR",
-            "cursor must match repository, generation and request; restart pagination",
-            2,
+impl CursorContext<'_> {
+    fn fingerprint(&self, operation: &str, args: &Value) -> String {
+        let mut request = args.clone();
+        if let Some(map) = request.as_object_mut() {
+            for key in [
+                "cursor",
+                "limit",
+                "max_response_bytes",
+                "timeout_ms",
+                "require_fresh",
+            ] {
+                map.remove(key);
+            }
+        }
+        hash(
+            serde_json::to_vec(&json!([
+                self.repo_id,
+                self.generation_id,
+                self.config.fingerprint().unwrap_or_default(),
+                operation,
+                request
+            ]))
+            .unwrap_or_default(),
         )
-    };
-    let Some(value) = args.get("cursor").filter(|v| !v.is_null()) else {
-        return Ok(0);
-    };
-    let token = value.as_str().ok_or_else(invalid)?;
-    if token.len() > 512 {
-        return Err(invalid());
     }
-    // Compatibility adapter for existing transports. New responses never emit numeric cursors.
-    let offset = if token.bytes().all(|b| b.is_ascii_digit()) && !token.is_empty() {
-        token.parse::<usize>().map_err(|_| invalid())?
-    } else {
-        let parts = token.split('.').collect::<Vec<_>>();
-        if parts.len() != 3
-            || parts[0] != "kx1"
-            || parts[1] != fingerprint(service, operation, args)
-        {
+    pub fn cursor(&self, operation: &str, args: &Value, offset: usize) -> String {
+        format!("kx1.{}.{offset}", self.fingerprint(operation, args))
+    }
+    pub fn cursor_offset(&self, operation: &str, args: &Value) -> Result<usize> {
+        let invalid = || {
+            Error::new(
+                "INVALID_CURSOR",
+                "cursor must match repository, generation and request; restart pagination",
+                2,
+            )
+        };
+        let Some(value) = args.get("cursor").filter(|v| !v.is_null()) else {
+            return Ok(0);
+        };
+        let token = value.as_str().ok_or_else(invalid)?;
+        if token.len() > 512 {
             return Err(invalid());
         }
-        parts[2].parse::<usize>().map_err(|_| invalid())?
-    };
-    if offset > 100_000 {
-        return Err(invalid());
+        // Compatibility adapter for existing transports. New responses never emit numeric cursors.
+        let offset = if token.bytes().all(|b| b.is_ascii_digit()) && !token.is_empty() {
+            token.parse::<usize>().map_err(|_| invalid())?
+        } else {
+            let parts = token.split('.').collect::<Vec<_>>();
+            if parts.len() != 3
+                || parts[0] != "kx1"
+                || parts[1] != self.fingerprint(operation, args)
+            {
+                return Err(invalid());
+            }
+            parts[2].parse::<usize>().map_err(|_| invalid())?
+        };
+        if offset > 100_000 {
+            return Err(invalid());
+        }
+        Ok(offset)
     }
-    Ok(offset)
+}
+pub fn cursor(service: &Service, operation: &str, args: &Value, offset: usize) -> String {
+    CursorContext::from(service).cursor(operation, args, offset)
+}
+pub fn cursor_offset(service: &Service, operation: &str, args: &Value) -> Result<usize> {
+    CursorContext::from(service).cursor_offset(operation, args)
 }
 fn string() -> Value {
     json!({"type":"string","minLength":1,"maxLength":4096})
@@ -254,7 +277,7 @@ pub fn response_schema(operation: &str) -> Value {
             &["items"],
         ),
         "query" => object(
-            json!({"items":array(object(json!({"symbol":reference("symbol"),"score":{"type":"number"},"why_matched":array(string())}),&["symbol","score","why_matched"]))}),
+            json!({"items":array(object(json!({"symbol":reference("symbol"),"score":{"type":"number"},"why_matched":array(string())}),&["symbol","score","why_matched"])),"retrieval":object(json!({"algorithm":{"const":"weighted_rrf_v1"},"model_fingerprint":string(),"model_id":string(),"model_revision":string(),"candidates_examined":{"type":"integer","minimum":0,"maximum":10000},"experimental":{"const":true},"pretrained_quality_accepted":{"const":false}}),&["algorithm","model_fingerprint","model_id","model_revision","candidates_examined","experimental","pretrained_quality_accepted"])}),
             &["items"],
         ),
         "status" => object(

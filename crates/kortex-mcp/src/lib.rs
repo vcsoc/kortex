@@ -1,6 +1,6 @@
 //! MCP SDK adapter. No write/index/shell operation is exposed as a tool.
-use kortex_analysis::{Service, error_json};
-use kortex_core::{Error, Result};
+use kortex_analysis::{ReadService, error_json};
+use kortex_core::{Error, RequestControl, Result};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
 use serde_json::{Value, json};
 use std::{
@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    sync::Semaphore,
+    sync::{Semaphore, watch},
 };
 
 const OPERATIONS: [&str; 10] = [
@@ -31,6 +31,7 @@ pub struct Server {
     pub default_repo: Option<String>,
     pub config_path: Option<std::path::PathBuf>,
     slots: Arc<Semaphore>,
+    shutdown: watch::Sender<bool>,
 }
 impl Server {
     pub fn new(repo: Option<String>) -> Self {
@@ -38,7 +39,29 @@ impl Server {
             default_repo: repo,
             config_path: None,
             slots: Arc::new(Semaphore::new(4)),
+            shutdown: watch::channel(false).0,
         }
+    }
+    /// Stop admission and cooperatively cancel in-flight work, without detaching permits.
+    pub fn shutdown(&self) {
+        self.shutdown.send_replace(true);
+        self.slots.close();
+    }
+    async fn cancelled(&self) {
+        let mut receiver = self.shutdown.subscribe();
+        let _ = receiver.wait_for(|stopped| *stopped).await;
+    }
+}
+struct CancelOnDrop(RequestControl);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+struct ShutdownOnDrop(Server);
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 pub fn schema(operation: &str) -> Value {
@@ -223,6 +246,13 @@ impl ServerHandler for Server {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ReadResourceResponse, ErrorData> {
+        if *self.shutdown.borrow() || context.ct.is_cancelled() {
+            return Err(protocol_error(Error::new(
+                "CANCELLED",
+                "request cancelled",
+                9,
+            )));
+        }
         if !matches!(
             request.uri.as_str(),
             "kortex://repositories" | "kortex://schema" | "kortex://status"
@@ -240,23 +270,34 @@ impl ServerHandler for Server {
                 9,
             ))
         })?;
+        let control = RequestControl::new(Duration::from_secs(10)).map_err(protocol_error)?;
+        let _cancel_on_drop = CancelOnDrop(control.clone());
+        let worker_control = control.clone();
         let repo = self.default_repo.clone();
         let config_path = self.config_path.clone();
         let worker = tokio::task::spawn_blocking(move || -> Result<ReadResourceResult> {
             let _permit = permit;
+            worker_control.check()?;
             let mut budget = 131072;
             let value = match request.uri.as_str() {
                 "kortex://repositories" => kortex_analysis::list_repos()?,
                 "kortex://schema" => {
-                    json!({"schema_version":"1.0","coordinates":"1-based UTF-8 byte columns; half-open byte spans","resolution":["exact","inferred","ambiguous","unresolved"],"edge_kinds":["DECLARES","CALLS","IMPORTS","REFERENCES","USES_TYPE"],"source_is_untrusted":true})
+                    // The shared graph schema is authoritative, including kind and resolution
+                    // constraints. Do not maintain a second (inevitably stale) kind list here.
+                    json!({"schema_version":"1.0","coordinates":"1-based UTF-8 byte columns; half-open byte spans","graph":kortex_analysis::response_schema("graph"),"source_is_untrusted":true})
                 }
                 _ => {
-                    let root = kortex_analysis::select_repo(repo.as_deref())?;
-                    let service = Service::open_with_config(&root, config_path.as_deref())?;
+                    let service =
+                        ReadService::open_selected(repo.as_deref(), config_path.as_deref())?;
                     budget = budget.min(service.config.mcp.max_response_bytes);
-                    service.execute("status", &json!({}))?
+                    worker_control.check()?;
+                    let value =
+                        service.execute_with_control("status", &json!({}), &worker_control)?;
+                    worker_control.check()?;
+                    value
                 }
             };
+            worker_control.check()?;
             let text = serde_json::to_string(&value)?;
             let result: ReadResourceResult = serde_json::from_value(
                 json!({"contents":[{"uri":request.uri,"mimeType":"application/json","text":text}]}),
@@ -272,13 +313,14 @@ impl ServerHandler for Server {
             Ok(result)
         });
         tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(10), worker) => match result {
+            result = tokio::time::timeout_at(control.deadline().into(), worker) => match result {
                 Ok(Ok(Ok(value))) => Ok(value.into()),
                 Ok(Ok(Err(e))) => Err(protocol_error(e)),
                 Ok(Err(_)) => Err(protocol_error(Error::new("WORKER_ERROR", "resource worker failed", 1))),
-                Err(_) => Err(protocol_error(Error::new("QUERY_TIMEOUT", "request exceeded ten seconds", 9))),
+                Err(_) => Err(protocol_error(Error::new("TIMEOUT", "request deadline exceeded", 9))),
             },
             _ = context.ct.cancelled() => Err(protocol_error(Error::new("CANCELLED", "request cancelled", 9))),
+            _ = self.cancelled() => Err(protocol_error(Error::new("CANCELLED", "server shutting down", 9))),
         }
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -291,6 +333,9 @@ impl ServerHandler for Server {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        if *self.shutdown.borrow() || context.ct.is_cancelled() {
+            return Ok(tool_error(Error::new("CANCELLED", "request cancelled", 9)).into());
+        }
         let op = request
             .name
             .strip_prefix("kortex_")
@@ -312,18 +357,25 @@ impl ServerHandler for Server {
                 .into());
             }
         };
+        let control = RequestControl::new(Duration::from_millis(
+            args["timeout_ms"].as_u64().unwrap_or(10_000).min(10_000),
+        ))
+        .map_err(protocol_error)?;
+        let _cancel_on_drop = CancelOnDrop(control.clone());
+        let worker_control = control.clone();
         let repo = self.default_repo.clone();
         let config_path = self.config_path.clone();
         let worker = tokio::task::spawn_blocking(move || -> Result<Value> {
             let _permit = permit;
+            worker_control.check()?;
             let mut args = args;
             if op == "list_repos" {
-                return execute_bounded(None, &op, args, 262144);
+                return execute_bounded(None, &op, args, 262144, &worker_control);
             }
-            let root = kortex_analysis::select_repo(
+            let service = ReadService::open_selected(
                 args.get("repo").and_then(Value::as_str).or(repo.as_deref()),
+                config_path.as_deref(),
             )?;
-            let service = Service::open_with_config(&root, config_path.as_deref())?;
             if let Some(object) = args.as_object_mut() {
                 object.remove("repo");
             }
@@ -332,38 +384,39 @@ impl ServerHandler for Server {
                 &op,
                 args,
                 service.config.mcp.max_response_bytes,
+                &worker_control,
             )
         });
         let outcome = tokio::select! {
-            result=tokio::time::timeout(Duration::from_secs(10),worker)=>result,
+            result=tokio::time::timeout_at(control.deadline().into(),worker)=>result,
             _=context.ct.cancelled()=>return Ok(tool_error(Error::new("CANCELLED","request cancelled",9)).into()),
+            _=self.cancelled()=>return Ok(tool_error(Error::new("CANCELLED","server shutting down",9)).into()),
         };
         let result = match outcome {
             Ok(Ok(Ok(value))) => CallToolResult::structured(value),
             Ok(Ok(Err(e))) => tool_error(e),
             Ok(Err(_)) => tool_error(Error::new("WORKER_ERROR", "tool worker failed", 1)),
-            Err(_) => tool_error(Error::new(
-                "QUERY_TIMEOUT",
-                "request exceeded ten seconds",
-                9,
-            )),
+            Err(_) => tool_error(Error::new("TIMEOUT", "request deadline exceeded", 9)),
         };
         Ok(result.into())
     }
 }
 fn execute_bounded(
-    service: Option<&Service>,
+    service: Option<&ReadService>,
     operation: &str,
     mut args: Value,
     budget: usize,
+    control: &RequestControl,
 ) -> Result<Value> {
     let mut reduced = false;
     loop {
+        control.check()?;
         let mut value = if let Some(service) = service {
-            service.execute(operation, &args)?
+            service.execute_with_control(operation, &args, control)?
         } else {
             kortex_analysis::list_repos_page(&args)?
         };
+        control.check()?;
         if reduced {
             value["truncated"] = json!(true);
         }
@@ -416,6 +469,7 @@ fn protocol_error(error: Error) -> ErrorData {
 struct BoundedReader<R> {
     inner: R,
     line: Vec<u8>,
+    shutdown: Option<watch::Sender<bool>>,
 }
 fn bounded_request_id(line: &[u8]) -> bool {
     // Malformed JSON is left to the SDK's parse-error handling, which uses a null ID.
@@ -431,11 +485,21 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
+        let had_capacity = buf.remaining() > 0;
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if (matches!(&result, Poll::Ready(Err(_)))
+            || matches!(&result, Poll::Ready(Ok(())) if had_capacity && buf.filled().len() == before))
+            && let Some(shutdown) = &self.shutdown
+        {
+            shutdown.send_replace(true);
+        }
         if let Poll::Ready(Ok(())) = result {
             for byte in &buf.filled()[before..] {
                 if *byte == b'\n' {
                     if !bounded_request_id(&self.line) {
+                        if let Some(shutdown) = &self.shutdown {
+                            shutdown.send_replace(true);
+                        }
                         buf.set_filled(before);
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -445,6 +509,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
                     self.line.clear();
                 } else {
                     if self.line.len() >= 65536 {
+                        if let Some(shutdown) = &self.shutdown {
+                            shutdown.send_replace(true);
+                        }
                         buf.set_filled(before);
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -467,13 +534,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
 pub fn serve(repo: Option<&str>, config_path: Option<&std::path::Path>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .max_blocking_threads(4)
+        // Four admitted application workers must not starve Tokio's blocking stdio I/O.
+        .max_blocking_threads(8)
         .enable_all()
         .build()?;
     runtime.block_on(async{
         let mut server=Server::new(repo.map(str::to_owned));
         server.config_path=config_path.map(std::path::Path::to_path_buf);
-        let service=server.serve((BoundedReader{inner:tokio::io::stdin(),line:Vec::new()},tokio::io::stdout())).await.map_err(|e|Error::new("MCP_PROTOCOL",e.to_string(),2))?;
+        let shutdown = server.shutdown.clone();
+        let _shutdown_on_drop = ShutdownOnDrop(server.clone());
+        let service=server.serve((BoundedReader{inner:tokio::io::stdin(),line:Vec::new(),shutdown:Some(shutdown)},tokio::io::stdout())).await.map_err(|e|Error::new("MCP_PROTOCOL",e.to_string(),2))?;
         let handle=service.cancellation_token();
         tokio::select!{_ = tokio::signal::ctrl_c()=>{handle.cancel();}, result=service.waiting()=>{result.map_err(|e|Error::new("MCP_PROTOCOL",e.to_string(),2))?;}}
         Ok(())
@@ -482,7 +552,7 @@ pub fn serve(repo: Option<&str>, config_path: Option<&std::path::Path>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn indexed_service() -> (tempfile::TempDir, Service) {
+    fn indexed_service() -> (tempfile::TempDir, ReadService) {
         let root = tempfile::tempdir().unwrap();
         let source = (0..30)
             .map(|i| {
@@ -499,7 +569,7 @@ mod tests {
             &kortex_indexer::Options::default(),
         )
         .unwrap();
-        let service = Service::open(root.path()).unwrap();
+        let service = ReadService::open_selected(root.path().to_str(), None).unwrap();
         (root, service)
     }
     #[test]
@@ -513,7 +583,14 @@ mod tests {
             if let Some(next) = cursor.take() {
                 args["cursor"] = next;
             }
-            let value = execute_bounded(Some(&service), "query", args, 8192).unwrap();
+            let value = execute_bounded(
+                Some(&service),
+                "query",
+                args,
+                8192,
+                &RequestControl::new(Duration::from_secs(10)).unwrap(),
+            )
+            .unwrap();
             assert!(
                 serde_json::to_vec(&CallToolResult::structured(value.clone()))
                     .unwrap()
@@ -538,7 +615,8 @@ mod tests {
                 Some(&service),
                 "graph",
                 json!({"symbol":"item_00","depth":0}),
-                1024
+                1024,
+                &RequestControl::new(Duration::from_secs(10)).unwrap(),
             )
             .unwrap_err()
             .code,
@@ -551,9 +629,37 @@ mod tests {
         let mut reader = BoundedReader {
             inner: std::io::Cursor::new(vec![b'x'; 65537]),
             line: Vec::new(),
+            shutdown: None,
         };
         let mut bytes = vec![];
         assert!(reader.read_to_end(&mut bytes).await.is_err());
+    }
+    #[tokio::test]
+    async fn reader_eof_and_refused_frames_signal_shutdown_but_empty_reads_do_not() {
+        use tokio::io::AsyncReadExt;
+        for input in [
+            Vec::new(),
+            vec![b'x'; 65537],
+            format!("{}\n", json!({"id":"x".repeat(129)})).into_bytes(),
+        ] {
+            let (shutdown, receiver) = watch::channel(false);
+            let mut reader = BoundedReader {
+                inner: std::io::Cursor::new(input),
+                line: Vec::new(),
+                shutdown: Some(shutdown),
+            };
+            let mut zero = [];
+            assert_eq!(reader.read(&mut zero).await.unwrap(), 0);
+            assert!(
+                !*receiver.borrow(),
+                "zero-capacity reads are not transport EOF"
+            );
+            let _ = reader.read_to_end(&mut Vec::new()).await;
+            assert!(
+                *receiver.borrow(),
+                "EOF/protocol refusal cancels sibling work"
+            );
+        }
     }
     #[test]
     fn schemas_reject_unknown_and_unbounded_inputs() {
@@ -570,6 +676,7 @@ mod tests {
             "query",
             json!({"text":"item_","limit":1}),
             8192,
+            &RequestControl::new(Duration::from_secs(10)).unwrap(),
         )
         .unwrap();
         let valid = page["page"]["next_cursor"].as_str().unwrap();

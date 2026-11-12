@@ -33,7 +33,7 @@ fn other_user_writable_index_artifacts_are_refused_without_mutation() {
 
 #[test]
 fn other_user_writable_registry_is_refused_without_mutation() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().join("registry.db");
     drop(Registry::at(&path).unwrap());
     let original = fs::read(&path).unwrap();

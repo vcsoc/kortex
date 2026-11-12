@@ -1,7 +1,7 @@
 //! Bounded deterministic graph algorithms with evidence paths.
 #[cfg(test)]
 mod control_tests;
-use kortex_core::{Edge, Error, Result, Snapshot};
+use kortex_core::{Edge, Error, RequestControl, Result, Snapshot};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -77,7 +77,19 @@ pub fn traverse(
     limits: &Limits,
     all_edges: bool,
 ) -> Result<Traversal> {
-    traverse_selected(snapshot, start, direction, limits, all_edges, None)
+    let control = RequestControl::new(Duration::from_millis(limits.timeout_ms))?;
+    traverse_with_control(snapshot, start, direction, limits, all_edges, &control)
+}
+/// Shared cancellation and monotonic deadline; graph policy can only shorten the deadline.
+pub fn traverse_with_control(
+    snapshot: &Snapshot,
+    start: &str,
+    direction: Direction,
+    limits: &Limits,
+    all_edges: bool,
+    control: &RequestControl,
+) -> Result<Traversal> {
+    traverse_selected(snapshot, start, direction, limits, all_edges, None, control)
 }
 /// Restrict traversal to explicitly evidenced relationship kinds (e.g. process CALLS).
 pub fn traverse_kinds(
@@ -87,7 +99,26 @@ pub fn traverse_kinds(
     limits: &Limits,
     edge_kinds: &[&str],
 ) -> Result<Traversal> {
-    traverse_selected(snapshot, start, direction, limits, false, Some(edge_kinds))
+    let control = RequestControl::new(Duration::from_millis(limits.timeout_ms))?;
+    traverse_kinds_with_control(snapshot, start, direction, limits, edge_kinds, &control)
+}
+pub fn traverse_kinds_with_control(
+    snapshot: &Snapshot,
+    start: &str,
+    direction: Direction,
+    limits: &Limits,
+    edge_kinds: &[&str],
+    control: &RequestControl,
+) -> Result<Traversal> {
+    traverse_selected(
+        snapshot,
+        start,
+        direction,
+        limits,
+        false,
+        Some(edge_kinds),
+        control,
+    )
 }
 fn traverse_selected(
     snapshot: &Snapshot,
@@ -96,6 +127,7 @@ fn traverse_selected(
     limits: &Limits,
     all_edges: bool,
     edge_kinds: Option<&[&str]>,
+    control: &RequestControl,
 ) -> Result<Traversal> {
     if limits.depth > 10 || limits.max_nodes == 0 || limits.max_nodes > 10000 {
         return Err(Error::new(
@@ -104,16 +136,16 @@ fn traverse_selected(
             2,
         ));
     }
-    let deadline = Instant::now() + Duration::from_millis(limits.timeout_ms);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(limits.timeout_ms))
+        .ok_or_else(|| Error::new("QUERY_LIMIT", "graph timeout is not representable", 2))?;
+    let control = control.restrict_deadline(deadline);
+    control.check()?;
     let mut adjacency: BTreeMap<&str, Vec<(&str, &Edge)>> = BTreeMap::new();
 
     for (index, e) in snapshot.edges.iter().enumerate() {
-        if index % 1024 == 0 && Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "graph adjacency exceeded deadline",
-                9,
-            ));
+        if index % 1024 == 0 {
+            control.check()?;
         }
         if edge_kinds.is_some_and(|kinds| !kinds.contains(&e.kind.as_str()))
             || (!all_edges && !dependency(e))
@@ -141,25 +173,15 @@ fn traverse_selected(
     let mut edges = BTreeMap::new();
     let mut truncated = false;
     while let Some((node, depth, confidence, path)) = queue.pop_front() {
-        if Instant::now() > deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "graph query exceeded deadline",
-                9,
-            ));
-        }
+        control.check()?;
         for (index, (next, e)) in adjacency
             .get(node.as_str())
             .into_iter()
             .flatten()
             .enumerate()
         {
-            if index % 1024 == 0 && Instant::now() >= deadline {
-                return Err(Error::new(
-                    "QUERY_TIMEOUT",
-                    "graph expansion exceeded deadline",
-                    9,
-                ));
+            if index % 1024 == 0 {
+                control.check()?;
             }
             if depth >= limits.depth {
                 if !seen.contains(*next) {
@@ -190,12 +212,8 @@ fn traverse_selected(
     let mut ambiguous = 0;
     let mut unresolved = 0;
     for (index, e) in snapshot.edges.iter().enumerate() {
-        if index % 1024 == 0 && Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "graph ambiguity scan exceeded deadline",
-                9,
-            ));
+        if index % 1024 == 0 {
+            control.check()?;
         }
         if edge_kinds.is_some_and(|kinds| !kinds.contains(&e.kind.as_str()))
             || (!all_edges && !dependency(e))
@@ -211,6 +229,7 @@ fn traverse_selected(
             ambiguous += 1;
         }
     }
+    control.check()?;
     Ok(Traversal {
         items,
         edges: edges.into_values().collect(),

@@ -1,12 +1,9 @@
 //! Test associations require explicit test-framework source or a persisted TESTS edge.
 use crate::Service;
-use kortex_core::{Result, hash};
+use kortex_core::{RequestControl, Result, hash};
 use kortex_graph::Reach;
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, ParseOptions, Parser};
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut c = node.walk();
@@ -15,7 +12,7 @@ fn children(node: Node<'_>) -> Vec<Node<'_>> {
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
-fn shadowed(root: Node<'_>, alias: &str, source: &str, deadline: Instant) -> Result<bool> {
+fn shadowed(root: Node<'_>, alias: &str, source: &str, control: &RequestControl) -> Result<bool> {
     let mut imports = 0;
     let mut stack = vec![(root, 0)];
     let mut visited = 0;
@@ -24,13 +21,7 @@ fn shadowed(root: Node<'_>, alias: &str, source: &str, deadline: Instant) -> Res
         if depth > 256 || visited > 200_000 {
             return Ok(true);
         }
-        if Instant::now() >= deadline {
-            return Err(kortex_core::Error::new(
-                "QUERY_TIMEOUT",
-                "test binding deadline exceeded",
-                9,
-            ));
-        }
+        control.check()?;
         if matches!(node.kind(), "import_statement" | "import_from_statement") {
             for item in children(node)
                 .into_iter()
@@ -86,22 +77,27 @@ fn shadowed(root: Node<'_>, alias: &str, source: &str, deadline: Instant) -> Res
 pub fn evidenced_tests(
     service: &Service,
     candidates: &BTreeSet<String>,
-    deadline: Instant,
+    control: &RequestControl,
 ) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
-    for edge in service.snapshot.edges.iter().filter(|e| {
-        e.kind == "TESTS"
-            && matches!(e.resolution.as_str(), "exact" | "inferred")
-            && e.target_id
+    for edge in &service.snapshot.edges {
+        control.check()?;
+        if !(edge.kind == "TESTS"
+            && matches!(edge.resolution.as_str(), "exact" | "inferred")
+            && edge
+                .target_id
                 .as_deref()
                 .is_some_and(|id| service.snapshot.symbol(id).is_some())
-            && service.snapshot.symbol(&e.source_id).is_some()
-            && !e.evidence.is_empty()
-            && !e.resolver.is_empty()
-    }) {
+            && service.snapshot.symbol(&edge.source_id).is_some()
+            && !edge.evidence.is_empty()
+            && !edge.resolver.is_empty())
+        {
+            continue;
+        }
         out.insert(edge.source_id.clone(),json!({"framework":"indexed-tests-edge","edge_id":edge.id,"evidence":edge.evidence,"source_span":edge.source_span}));
     }
     for file in &service.snapshot.files {
+        control.check()?;
         if !matches!(file.language.as_str(), "rust" | "python")
             || !file
                 .symbols
@@ -110,21 +106,20 @@ pub fn evidenced_tests(
         {
             continue;
         }
-        if Instant::now() >= deadline {
-            return Err(kortex_core::Error::new(
-                "QUERY_TIMEOUT",
-                "test evidence deadline exceeded",
-                9,
-            ));
-        }
-        let source = match kortex_repo::read_confined(
+        control.check()?;
+        let source = match kortex_repo::read_confined_with_control(
             &service.root,
             &file.path,
             service.config.repository.max_file_size_bytes,
+            control,
         ) {
             Ok(s) if hash(&s) == file.content_hash => s,
-            _ => continue,
+            _ => {
+                control.check()?;
+                continue;
+            }
         };
+        control.check()?;
         let grammar = if file.language == "rust" {
             tree_sitter_rust::LANGUAGE.into()
         } else {
@@ -135,7 +130,7 @@ pub fn evidenced_tests(
             .set_language(&grammar)
             .map_err(|e| kortex_core::Error::new("GRAMMAR_ERROR", e.to_string(), 7))?;
         let bytes = source.as_bytes();
-        let mut cancel = |_: &tree_sitter::ParseState| Instant::now() >= deadline;
+        let mut cancel = |_: &tree_sitter::ParseState| control.check().is_err();
         let tree = parser
             .parse_with_options(
                 &mut |offset, _| &bytes[offset..],
@@ -143,12 +138,11 @@ pub fn evidenced_tests(
                 Some(ParseOptions::new().progress_callback(&mut cancel)),
             )
             .ok_or_else(|| {
-                kortex_core::Error::new(
-                    "QUERY_TIMEOUT",
-                    "test evidence parser deadline exceeded",
-                    9,
-                )
+                control.check().err().unwrap_or_else(|| {
+                    kortex_core::Error::new("PARSE_FAILED", "test evidence parser aborted", 7)
+                })
             })?;
+        control.check()?;
         if tree.root_node().has_error() {
             continue;
         }
@@ -189,12 +183,12 @@ pub fn evidenced_tests(
         let mut verified_classes = vec![];
         if !local_unittest {
             for alias in unittest_aliases {
-                if !shadowed(tree.root_node(), &alias, &source, deadline)? {
+                if !shadowed(tree.root_node(), &alias, &source, control)? {
                     verified_modules.push(alias);
                 }
             }
             for alias in testcase_aliases {
-                if !shadowed(tree.root_node(), &alias, &source, deadline)? {
+                if !shadowed(tree.root_node(), &alias, &source, control)? {
                     verified_classes.push(alias);
                 }
             }
@@ -204,13 +198,7 @@ pub fn evidenced_tests(
             if depth > 256 {
                 continue;
             }
-            if Instant::now() >= deadline {
-                return Err(kortex_core::Error::new(
-                    "QUERY_TIMEOUT",
-                    "test AST deadline exceeded",
-                    9,
-                ));
-            }
+            control.check()?;
             let framework = if n.kind() == "function_item"
                 && n.prev_named_sibling().is_some_and(|p| {
                     p.kind() == "attribute_item"
@@ -258,8 +246,13 @@ pub fn evidenced_tests(
     }
     Ok(out)
 }
-pub fn associations(service: &Service, items: &[Reach], deadline: Instant) -> Result<Vec<Value>> {
+pub fn associations(
+    service: &Service,
+    items: &[Reach],
+    control: &RequestControl,
+) -> Result<Vec<Value>> {
+    control.check()?;
     let candidates = items.iter().map(|r| r.symbol_id.clone()).collect();
-    let tests = evidenced_tests(service, &candidates, deadline)?;
+    let tests = evidenced_tests(service, &candidates, control)?;
     Ok(items.iter().filter_map(|reach|tests.get(&reach.symbol_id).map(|evidence|json!({"symbol_id":reach.symbol_id,"depth":reach.depth,"confidence":reach.confidence,"edge_path":reach.edge_path,"test_evidence":evidence}))).collect())
 }

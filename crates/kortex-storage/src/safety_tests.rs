@@ -213,8 +213,9 @@ fn wrong_repository_lock_and_read_only_commit_do_not_change_index() {
 fn future_schema_is_refused_without_rewriting_database() {
     let d = tempfile::tempdir().unwrap();
     let directory = d.path().join(".kortex");
-    fs::create_dir(&directory).unwrap();
+    crate::test_support::directory(&directory).unwrap();
     let db = directory.join("index.db");
+    crate::test_support::file(&db, b"").unwrap();
     let conn = Connection::open(&db).unwrap();
     conn.execute_batch("PRAGMA user_version=99; CREATE TABLE future(payload TEXT); INSERT INTO future VALUES('retain this');").unwrap();
     drop(conn);
@@ -240,8 +241,9 @@ fn missing_schema_and_corrupt_snapshot_have_distinct_diagnostics() {
         "INDEX_NOT_FOUND"
     );
     assert!(!d.path().join(".kortex").exists());
-    fs::create_dir(d.path().join(".kortex")).unwrap();
+    crate::test_support::directory(&d.path().join(".kortex")).unwrap();
     let db = d.path().join(".kortex/index.db");
+    crate::test_support::file(&db, b"").unwrap();
     drop(Connection::open(&db).unwrap());
     assert_eq!(
         Store::open(d.path(), false).err().unwrap().code,
@@ -271,11 +273,11 @@ fn missing_schema_and_corrupt_snapshot_have_distinct_diagnostics() {
 fn corrupt_database_and_existing_backup_are_never_replaced() {
     let d = tempfile::tempdir().unwrap();
     let directory = d.path().join(".kortex");
-    fs::create_dir(&directory).unwrap();
+    crate::test_support::directory(&directory).unwrap();
     let db = directory.join("index.db");
     let backup = directory.join("index.db.bak");
-    fs::write(&db, "corrupt original evidence").unwrap();
-    fs::write(&backup, "previous preserved backup").unwrap();
+    crate::test_support::file(&db, b"corrupt original evidence").unwrap();
+    crate::test_support::file(&backup, b"previous preserved backup").unwrap();
     #[cfg(unix)]
     let owners = {
         use std::os::unix::fs::MetadataExt;

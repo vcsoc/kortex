@@ -3,6 +3,21 @@ import cytoscape from "cytoscape";
 import type { Core } from "cytoscape";
 import { download, exportJSON } from "./api";
 import type { Envelope, Graph } from "./api";
+// DOM text nodes escape markup, but XML 1.0 also forbids some valid source-text
+// characters (and lone UTF-16 surrogates introduced by label truncation).
+function xmlText(value: string): string {
+  return Array.from(value, (character) => {
+    const code = character.codePointAt(0)!;
+    return code === 9 ||
+      code === 10 ||
+      code === 13 ||
+      (code >= 0x20 && code <= 0xd7ff) ||
+      (code >= 0xe000 && code <= 0xfffd) ||
+      (code >= 0x10000 && code <= 0x10ffff)
+      ? character
+      : "\uFFFD";
+  }).join("");
+}
 export function GraphView({
   result,
   onSelect,
@@ -104,7 +119,9 @@ export function GraphView({
       `${box.x1 - pad} ${box.y1 - pad} ${box.w + pad * 2} ${box.h + pad * 2}`,
     );
     const desc = document.createElementNS(ns, "desc");
-    desc.textContent = `Kortex indexed graph ${result.repo_id}, generation ${result.generation_id}. Only loaded bounded evidence.`;
+    desc.textContent = xmlText(
+      `Kortex indexed graph ${result.repo_id}, generation ${result.generation_id}. Only loaded bounded evidence.`,
+    );
     root.append(desc);
     const background = document.createElementNS(ns, "rect");
     for (const [key, value] of Object.entries({
@@ -151,9 +168,11 @@ export function GraphView({
         line.setAttribute(k, String(v));
       const evidence = result.data.edges.find((edge) => edge.id === e.id());
       const title = document.createElementNS(ns, "title");
-      title.textContent = evidence
-        ? `${evidence.kind} · ${evidence.resolution} · confidence ${evidence.confidence}: ${evidence.evidence}`
-        : e.data("label");
+      title.textContent = xmlText(
+        evidence
+          ? `${evidence.kind} · ${evidence.resolution} · confidence ${evidence.confidence}: ${evidence.evidence}`
+          : String(e.data("label")),
+      );
       line.append(title);
       root.append(line);
     });
@@ -168,16 +187,18 @@ export function GraphView({
       const symbol = result.data.nodes.find(
         (symbol) => symbol.symbol_id === n.id(),
       );
-      title.textContent = symbol
-        ? `${symbol.qualified_name} (${symbol.file_path}:${symbol.span.start_line}) · ${n.id()}`
-        : n.id();
+      title.textContent = xmlText(
+        symbol
+          ? `${symbol.qualified_name} (${symbol.file_path}:${symbol.span.start_line}) · ${n.id()}`
+          : n.id(),
+      );
       circle.append(title);
       root.append(circle);
       const label = document.createElementNS(ns, "text");
       label.setAttribute("x", String(p.x + 16));
       label.setAttribute("y", String(p.y + 4));
       label.setAttribute("fill", dark ? "#e8edf6" : "#162437");
-      label.textContent = n.data("label");
+      label.textContent = xmlText(String(n.data("label")));
       root.append(label);
     });
     download(

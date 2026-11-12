@@ -1,6 +1,6 @@
 //! Git spans are meaningful only in the file content from which they were indexed.
 use super::{Service, boolean, commit, string};
-use kortex_core::{Error, Result, hash};
+use kortex_core::{Error, RequestControl, Result, hash};
 use kortex_graph::Direction;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -79,13 +79,14 @@ fn patch_path(raw: &str, prefix: &str) -> Result<Option<String>> {
 }
 
 impl Service {
-    pub(super) fn change_analysis(&self, args: &Value) -> Result<Value> {
+    pub(super) fn change_analysis(&self, args: &Value, control: &RequestControl) -> Result<Value> {
+        control.check()?;
         let staged = boolean(args, "staged", false)?;
         let unstaged = boolean(args, "unstaged", false)?;
         let reference = |key| -> Result<Option<String>> {
             match args.get(key) {
                 None | Some(Value::Null) => Ok(None),
-                _ => commit(&self.root, string(args, key)?).map(Some),
+                _ => commit(&self.root, string(args, key)?, control).map(Some),
             }
         };
         let base = reference("base")?;
@@ -111,11 +112,18 @@ impl Service {
         // compares HEAD (or the empty tree for an unborn branch) -> index.
         let old_revision = base.clone().or_else(|| {
             if staged {
-                kortex_repo::head(&self.root)
+                kortex_repo::git_with_control(
+                    &self.root,
+                    &["rev-parse", "--verify", "HEAD"],
+                    control,
+                )
+                .ok()
+                .map(|s| s.trim().to_owned())
             } else {
                 Some(String::new())
             }
         });
+        control.check()?;
         let new_revision = head.clone().or_else(|| staged.then(String::new));
         let old_kind = match old_revision.as_deref() {
             None => "empty_tree",
@@ -130,7 +138,11 @@ impl Service {
         // Even --no-ext-diff/--no-textconv do not disable clean/process
         // filters when Git reads the worktree. Override every configured
         // filter command without evaluating it or trusting attribute names.
-        let keys = kortex_repo::git(&self.root, &["config", "--null", "--name-only", "--list"])?;
+        let keys = kortex_repo::git_with_control(
+            &self.root,
+            &["config", "--null", "--name-only", "--list"],
+            control,
+        )?;
         let mut filter_overrides = vec![];
         for key in keys
             .split_terminator('\0')
@@ -169,10 +181,10 @@ impl Service {
             command.extend(revisions.iter().map(String::as_str));
             command.push("--");
             command.extend_from_slice(paths);
-            kortex_repo::git(&self.root, &command)
+            kortex_repo::git_with_control(&self.root, &command, control)
         };
         let omitted_submodule_worktrees = new_kind == "worktree"
-            && kortex_repo::git(&self.root, &["ls-files", "--stage", "-z"])?
+            && kortex_repo::git_with_control(&self.root, &["ls-files", "--stage", "-z"], control)?
                 .split_terminator('\0')
                 .any(|entry| entry.starts_with("160000 "));
         let raw = diff(&["--name-status", "-z"], &[])?;
@@ -185,6 +197,7 @@ impl Service {
             warnings.insert("submodule working-tree changes are not inspected: query each submodule separately; recursive Git dirty checks may execute nested filters".to_owned());
         }
         while let Some(status) = parts.next() {
+            control.check()?;
             let old = parts.next().ok_or_else(|| {
                 Error::new("INVALID_DIFF", "incomplete Git name-status output", 2)
             })?;
@@ -216,6 +229,7 @@ impl Service {
             let mut header_new = None;
             let mut in_hunk = false;
             for line in patch.lines() {
+                control.check()?;
                 if line.starts_with("diff --git ") {
                     header_old = None;
                     header_new = None;
@@ -257,14 +271,16 @@ impl Service {
                     return None;
                 }
                 let content = match revision {
-                    Some(revision) => kortex_repo::git(
+                    Some(revision) => kortex_repo::git_with_control(
                         &self.root,
                         &["cat-file", "blob", &format!("{revision}:{path}")],
+                        control,
                     ),
                     None => {
-                        let attributes = kortex_repo::git(
+                        let attributes = kortex_repo::git_with_control(
                             &self.root,
                             &["check-attr", "-z", "working-tree-encoding", "--", path],
+                            control,
                         );
                         let encoding_safe = attributes.as_ref().is_ok_and(|raw| {
                             matches!(
@@ -286,10 +302,11 @@ impl Service {
                                 8,
                             ))
                         } else {
-                            kortex_repo::read_confined(
+                            kortex_repo::read_confined_with_control(
                                 &self.root,
                                 path,
                                 self.config.repository.max_file_size_bytes,
+                                control,
                             )
                         }
                     }
@@ -319,6 +336,7 @@ impl Service {
                 status.starts_with('A') || old_revision.is_none(),
             );
             let new_hash = side_hash(new_revision.as_deref(), path, status.starts_with('D'));
+            control.check()?;
             let mut ids = BTreeSet::new();
             let mut indexed_sides = BTreeSet::new();
             let mut indexed_file_ids = vec![];
@@ -384,8 +402,15 @@ impl Service {
         let mut affected = BTreeSet::new();
         let mut truncated = changed.len() > limits.max_nodes;
         for id in changed.iter().take(limits.max_nodes) {
-            let traversal =
-                kortex_graph::traverse(&self.snapshot, id, Direction::Upstream, &limits, false)?;
+            control.check()?;
+            let traversal = kortex_graph::traverse_with_control(
+                &self.snapshot,
+                id,
+                Direction::Upstream,
+                &limits,
+                false,
+                control,
+            )?;
             truncated |= traversal.truncated;
             for item in traversal.items {
                 if affected.contains(&item.symbol_id) {
@@ -398,11 +423,7 @@ impl Service {
                 }
             }
         }
-        let evidenced_tests = super::test_map::evidenced_tests(
-            self,
-            &affected,
-            std::time::Instant::now() + std::time::Duration::from_millis(limits.timeout_ms),
-        )?;
+        let evidenced_tests = super::test_map::evidenced_tests(self, &affected, control)?;
         let likely_tests: Vec<_> = affected
             .iter()
             .filter(|id| {

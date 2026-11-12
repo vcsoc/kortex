@@ -42,14 +42,14 @@ fn main() {
     }
     let config = Config::default();
     println!(
-        "diagnostic_only=true parser={} files={files} functions_per_file={functions} dataset_sha256={} workers=default max_workers=8",
+        "diagnostic_only=true parser={} files={files} functions_per_file={functions} dataset_blake3={} workers=default max_workers=8",
         kortex_core::PARSER_VERSION,
         hash(&dataset)
     );
     let start = Instant::now();
     let first = index_at_root(d.path(), &config, &Options::default()).unwrap();
     println!(
-        "full_index_ms={:.3} symbols={} edges={} edge_sha256={}",
+        "full_index_ms={:.3} symbols={} edges={} edge_blake3={}",
         millis(start),
         first.snapshot.symbols().count(),
         first.snapshot.edges.len(),

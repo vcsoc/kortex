@@ -1,7 +1,7 @@
 //! Index placement and fail-closed filesystem checks. No repository-controlled cache paths.
 use kortex_core::{Error, Result};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     path::{Path, PathBuf},
 };
 
@@ -77,73 +77,15 @@ pub(crate) fn canonical_cache_base(path: &Path) -> Result<PathBuf> {
         }
     }
 }
-pub(crate) fn check_index_directory(directory: &Path, storage: &str, create: bool) -> Result<()> {
-    if storage == "user-cache" {
-        // Validate the cache home, kortex and indexes parents as well as the hash leaf.
-        for ancestor in directory
-            .ancestors()
-            .skip(1)
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            check_directory(ancestor, create)?;
-        }
-    }
+pub(crate) fn check_index_directory(directory: &Path, _storage: &str, create: bool) -> Result<()> {
+    // The anchor now checks ALL ancestors, not only three cache parents. Existing
+    // non-writable cache-home ancestors may be readable; the artifact leaf is private.
     check_directory(directory, create)
 }
 pub(crate) fn check_directory(path: &Path, create: bool) -> Result<()> {
-    // Roots/cache homes are normalized first. Never follow a planted descendant symlink.
-    for ancestor in path.ancestors() {
-        if fs::symlink_metadata(ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(refused("index directory ancestors cannot be symlinks"));
-        }
-    }
-    match fs::symlink_metadata(path) {
-        Ok(m) => {
-            if !m.is_dir() || m.file_type().is_symlink() {
-                return Err(refused(
-                    "index directory must not be a symlink or non-directory",
-                ));
-            }
-            owner(&m)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if m.permissions().mode() & 0o022 != 0 {
-                    return Err(refused("index directory must not be group/world writable"));
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
-            let parent = path
-                .parent()
-                .ok_or_else(|| refused("index directory needs a parent"))?;
-            if !parent.exists() {
-                check_directory(parent, true)?;
-            } else if fs::symlink_metadata(parent)?.file_type().is_symlink() {
-                return Err(refused("index parent cannot be a symlink"));
-            }
-            #[cfg(unix)]
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(not(unix))]
-            let builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
-            }
-            check_directory(path, false)?;
-        }
-        Err(e) => return Err(e.into()),
-    }
-    Ok(())
+    // Full descriptor-walk ancestor policy. This does NOT turn subsequent ambient
+    // SQLite/repair paths into handle-bound operations, nor prove ACL privacy.
+    kortex_repo::placement::DirectoryAnchor::acquire(path, create).map(|_| ())
 }
 /// Validate reserved index ownership metadata without ever modifying existing records.
 pub(crate) fn identity(directory: &Path, root: &Path, create: bool) -> Result<()> {
@@ -152,16 +94,10 @@ pub(crate) fn identity(directory: &Path, root: &Path, create: bool) -> Result<()
     check_file(&path)?;
     let expected = serde_json::json!({"schema_version": 1, "canonical_root": root.canonicalize()?.to_str(), "identity": kortex_core::hash(root.canonicalize()?.to_string_lossy().as_bytes())});
     if path.exists() {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-        }
+        let anchor = kortex_repo::placement::DirectoryAnchor::acquire(directory, false)?;
         let mut bytes = vec![];
-        options
-            .open(&path)?
+        anchor
+            .open_existing("index-owner.json", false)?
             .take(16 * 1024 + 1)
             .read_to_end(&mut bytes)?;
         let actual = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
@@ -179,6 +115,7 @@ pub(crate) fn identity(directory: &Path, root: &Path, create: bool) -> Result<()
     }
     Ok(())
 }
+#[cfg(unix)]
 pub(crate) fn owner(metadata: &fs::Metadata) -> Result<()> {
     #[cfg(unix)]
     {
@@ -192,46 +129,88 @@ pub(crate) fn owner(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 pub(crate) fn check_file(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(m) => {
-            if !m.is_file() || m.file_type().is_symlink() {
-                return Err(refused(
-                    "index artifacts must be regular files, never symlinks",
-                ));
-            }
-            owner(&m)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if m.nlink() != 1 {
-                    return Err(refused("index artifacts cannot be hard links"));
-                }
-                if m.mode() & 0o022 != 0 {
-                    return Err(refused("index artifacts must not be group/world writable"));
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    Ok(())
-}
-pub(crate) fn open_private(path: &Path, exclusive: bool) -> Result<File> {
-    check_file(path)?;
-    let mut opts = OpenOptions::new();
-    opts.read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .create_new(exclusive);
+    kortex_repo::placement::require_derived_data_support()?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        for _ in 0..8 {
+            match fs::symlink_metadata(path) {
+                Ok(m) => {
+                    if !m.is_file() || m.file_type().is_symlink() {
+                        return Err(refused(
+                            "index artifacts must be regular files, never symlinks",
+                        ));
+                    }
+                    owner(&m)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        if m.nlink() == 0 {
+                            // An optional SQLite sidecar was unlinked during stat.
+                            continue;
+                        }
+                        if m.nlink() != 1 {
+                            return Err(refused("index artifacts cannot be hard links"));
+                        }
+                        if m.mode() & 0o077 != 0 {
+                            return Err(refused("index artifacts must have no group/world access"));
+                        }
+                    }
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| refused("artifact needs a parent"))?;
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| refused("artifact name must be UTF-8"))?;
+                    let anchor = kortex_repo::placement::DirectoryAnchor::acquire(parent, false)?;
+                    match anchor.open_existing(name, false) {
+                        Ok(_) => return Ok(()),
+                        Err(error) => match fs::symlink_metadata(path) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                            Ok(current) => {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::MetadataExt;
+                                    if (m.dev(), m.ino()) != (current.dev(), current.ino()) {
+                                        // Revalidate a genuinely replaced journal, never
+                                        // downgrade an existing unsafe file to absence.
+                                        continue;
+                                    }
+                                }
+                                #[cfg(not(unix))]
+                                let _ = current;
+                                return Err(error);
+                            }
+                            Err(_) => return Err(error),
+                        },
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(refused(
+            "artifact changed repeatedly during privacy validation",
+        ))
     }
-    let file = opts.open(path)?;
-    owner(&file.metadata()?)?;
-    check_file(path)?;
-    Ok(file)
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        unreachable!("unsupported capability returned before I/O")
+    }
+}
+pub(crate) fn open_private(path: &Path, exclusive: bool) -> Result<File> {
+    kortex_repo::placement::require_derived_data_support()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| refused("artifact needs a parent"))?;
+    let anchor = kortex_repo::placement::DirectoryAnchor::acquire(parent, false)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| refused("artifact name must be UTF-8"))?;
+    if exclusive || !path.try_exists()? {
+        return anchor.create_new(name);
+    }
+    anchor.open_existing(name, true)
 }

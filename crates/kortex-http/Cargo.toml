@@ -20,6 +20,8 @@ kortex-analysis.workspace = true
 kortex-storage.workspace = true
 
 [dev-dependencies]
+# Existing audited SQLite dependency: real lock-contention/cancellation fixtures only.
+rusqlite.workspace = true
 futures-util = "0.3"
 jsonschema = { version = "0.33", default-features = false }
 tower = { version = "0.5", features = ["util"] }

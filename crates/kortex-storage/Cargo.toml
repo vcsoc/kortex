@@ -8,8 +8,11 @@ license-file.workspace = true
 
 [dependencies]
 kortex-core.workspace = true
+# Shared descriptor-relative placement/capability policy; existing workspace crate.
+kortex-repo.workspace = true
 rusqlite.workspace = true
 fs2.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 # Safe effective-UID and O_NOFOLLOW access; rustix 1.1.6 is already locked.
@@ -24,6 +27,9 @@ winsafe = { version = "0.0.29", default-features = false, features = ["kernel"] 
 
 [dev-dependencies]
 tempfile.workspace = true
+# Existing independent parser/resolver crates, only for actual-source equivalence diagnostics.
+kortex-parse.workspace = true
+kortex-languages.workspace = true
 
 [lints]
 workspace = true

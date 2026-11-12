@@ -1,4 +1,5 @@
 //! Real production-router and loopback TCP contracts. Test registry is process-isolated.
+mod support;
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
@@ -71,7 +72,7 @@ fn index(path: &Path) -> kortex_core::Snapshot {
 #[test]
 fn production_http_contracts() {
     if std::env::var_os("KORTEX_HTTP_TEST_CHILD").is_none() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = support::tempdir().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "production_http_contracts", "--nocapture"])
             .env("KORTEX_HTTP_TEST_CHILD", "1")
@@ -86,8 +87,8 @@ fn production_http_contracts() {
         );
         return;
     }
-    let root = tempfile::tempdir().unwrap();
-    let hidden = tempfile::tempdir().unwrap();
+    let root = support::tempdir().unwrap();
+    let hidden = support::tempdir().unwrap();
     assert!(
         Command::new("git")
             .args(["init", "--quiet"])
@@ -163,7 +164,9 @@ fn production_http_contracts() {
         let(s,_,v)=call(&router,&format!("{base}/files?cursor={file_cursor}"),"GET",None,true,None).await;assert_eq!(s,StatusCode::BAD_REQUEST);assert_eq!(v["error"]["code"],"INVALID_CURSOR");
         let nested=root.path().join("nested");fs::create_dir(&nested).unwrap();assert!(Command::new("git").args(["init","--quiet"]).current_dir(&nested).status().unwrap().success());fs::write(nested.join("secret.py"),"def inner_secret():\n    pass\n").unwrap();let secret=index(&nested);
         fs::write(root.path().join(".kortex.toml"),"[repository]\nroot='nested'\n").unwrap();
-        let(s,_,v)=call(&router,&format!("{base}/status"),"GET",None,true,None).await;assert_eq!(s,StatusCode::OK,"{v}");assert_eq!(v["repo_id"],snapshot.repo_id);assert_ne!(v["repo_id"],secret.repo_id);assert_eq!(v["data"]["root"],snapshot.root);
+        // Registered identities now retain configuration provenance. Tampering fails closed
+        // instead of silently ignoring relocation; no unauthorized destination is opened.
+        let(s,_,v)=call(&router,&format!("{base}/status"),"GET",None,true,None).await;assert_eq!(s,StatusCode::FORBIDDEN,"{v}");assert_eq!(v["error"]["code"],"REPO_FORBIDDEN");assert!(v.get("data").is_none());assert!(!v.to_string().contains(&secret.repo_id));
     });
 }
 #[test]

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "notices": [
+    {
+      "package": "tree-sitter-java",
+      "version": "0.23.5",
+      "declared_license": "MIT",
+      "upstream_commit": "94703d5a6bed02b98e438d7cad1136c01a60ba2c",
+      "source": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-java/94703d5a6bed02b98e438d7cad1136c01a60ba2c/LICENSE",
+      "file": "tree-sitter-java-0.23.5/LICENSE",
+      "sha256": "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7",
+      "scope": "verbatim third-party notice omitted from published crate archive; not a first-party license grant"
+    },
+    {
+      "package": "tree-sitter-cpp",
+      "version": "0.23.4",
+      "declared_license": "MIT",
+      "upstream_commit": "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02",
+      "source": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-cpp/f41e1a044c8a84ea9fa8577fdd2eab92ec96de02/LICENSE",
+      "file": "tree-sitter-cpp-0.23.4/LICENSE",
+      "sha256": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1",
+      "scope": "verbatim third-party notice omitted from published crate archive; not a first-party license grant"
+    },
+    {
+      "package": "tree-sitter-ruby",
+      "version": "0.23.1",
+      "declared_license": "MIT",
+      "upstream_commit": "71bd32fb7607035768799732addba884a37a6210",
+      "source": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-ruby/71bd32fb7607035768799732addba884a37a6210/LICENSE",
+      "file": "tree-sitter-ruby-0.23.1/LICENSE",
+      "sha256": "ee006f02a3d856df282e409be2a86e24a65bb573a98b9c28343771141351bb6b",
+      "scope": "verbatim third-party notice omitted from published crate archive; not a first-party license grant"
+    }
+  ]
+}

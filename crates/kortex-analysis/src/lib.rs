@@ -1,17 +1,28 @@
 //! Shared application services used by CLI and MCP. No transport-specific semantics.
 mod changes;
 mod contracts;
+mod execution;
 mod intelligence;
 #[cfg(test)]
 mod intelligence_tests;
+mod read_service;
 mod rules;
 mod test_map;
+pub use read_service::ReadService;
+#[cfg(test)]
+mod read_query_tests;
+#[cfg(test)]
+mod read_service_tests;
 pub use contracts::{input_schema, response_schema};
 #[cfg(test)]
 mod changes_tests;
+#[cfg(all(test, feature = "local-embeddings"))]
+mod local_query_tests;
+#[cfg(test)]
+mod selection_tests;
 
 use kortex_config::Config;
-use kortex_core::{Error, Result, Snapshot, Symbol, hash};
+use kortex_core::{Error, RequestControl, Result, Snapshot, Symbol, hash};
 use kortex_graph::{Direction, Limits};
 use kortex_storage::{Store, registry::Registry};
 use serde_json::{Value, json};
@@ -72,7 +83,7 @@ fn collect_repos(deadline: Option<Instant>) -> Result<Value> {
                 9,
             ));
         }
-        let status = Service::open(Path::new(&root))
+        let status = Service::open_registered(&repo_id, Path::new(&root), None)
             .and_then(|s| s.freshness())
             .unwrap_or_else(|_| "unavailable".into());
         items.push(json!({"repo_id":repo_id,"root":root,"generation_id":generation_id,"index_status":status}));
@@ -135,28 +146,153 @@ pub fn list_repos_page(args: &Value) -> Result<Value> {
     }
     Ok(result)
 }
+/// Resolve configuration without opening index storage, including for corrupt-index repair.
+/// Registered identities retain their recorded origin and cannot be redirected by configuration.
+pub fn resolve_selection(
+    selector: Option<&str>,
+    config_path: Option<&Path>,
+) -> Result<(PathBuf, Config)> {
+    if let Some(selector) = selector {
+        if Path::new(selector).is_dir() {
+            return resolve_path_selection(Path::new(selector), config_path);
+        }
+        let row = Registry::open()?
+            .list()?
+            .into_iter()
+            .find(|row| row.0 == selector)
+            .ok_or_else(|| Error::new("REPO_NOT_FOUND", selector, 3))?;
+        return resolve_registered_selection(&row.0, Path::new(&row.1), config_path);
+    }
+    let current = std::env::current_dir()?;
+    for ancestor in current.ancestors() {
+        if ancestor.join(".kortex/index.db").is_file() {
+            // Prefer the registry selection of this exact index, not a guessed ancestor config.
+            let root = ancestor.canonicalize()?;
+            let repo_id = kortex_core::id(&["repository", &kortex_core::public_path(&root)]);
+            if Registry::open()?.list()?.iter().any(|row| row.0 == repo_id) {
+                return resolve_registered_selection(&repo_id, &root, config_path);
+            }
+            return resolve_path_selection(ancestor, config_path);
+        }
+    }
+    let rows = Registry::open()?.list()?;
+    if let [row] = rows.as_slice() {
+        return resolve_registered_selection(&row.0, Path::new(&row.1), config_path);
+    }
+    Err(Error::new(
+        if rows.is_empty() {
+            "REPO_NOT_FOUND"
+        } else {
+            "AMBIGUOUS_REPO"
+        },
+        "select a repository explicitly with --repo or repo input",
+        if rows.is_empty() { 3 } else { 4 },
+    ))
+}
+/// Legacy entries use only their exact root, never ancestor configuration discovery.
+fn resolve_registered_selection(
+    repo_id: &str,
+    authorized_root: &Path,
+    config_path: Option<&Path>,
+) -> Result<(PathBuf, Config)> {
+    let registry = Registry::open()?;
+    let row = registry
+        .list()?
+        .into_iter()
+        .find(|row| row.0 == repo_id)
+        .ok_or_else(|| Error::new("REPO_NOT_FOUND", repo_id, 3))?;
+    let root = authorized_root.canonicalize()?;
+    let registered_root = Path::new(&row.1).canonicalize()?;
+    let expected_id = kortex_core::id(&["repository", &kortex_core::public_path(&root)]);
+    if root != registered_root || repo_id != expected_id {
+        return Err(Error::new(
+            "REPO_FORBIDDEN",
+            "authorized registry root/identity mismatch",
+            8,
+        ));
+    }
+    let selection = registry.selection(repo_id)?;
+    if let Some(selection) = &selection
+        && (!selection.effective_root.is_absolute()
+            || selection.effective_root != root
+            || !selection.invocation_root.is_absolute()
+            || selection
+                .explicit_config
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute()))
+    {
+        return Err(Error::new(
+            "REPO_FORBIDDEN",
+            "invalid registered selection provenance",
+            8,
+        ));
+    }
+    let invocation = selection
+        .as_ref()
+        .map_or(root.as_path(), |s| s.invocation_root.as_path());
+    let explicit = config_path.or_else(|| {
+        selection
+            .as_ref()
+            .and_then(|s| s.explicit_config.as_deref())
+    });
+    let config = Config::load(invocation, explicit)?;
+    if config.resolved_root(invocation)? != root {
+        return Err(Error::new(
+            "REPO_FORBIDDEN",
+            "configuration changed the registered root; explicitly reindex the new selection",
+            8,
+        ));
+    }
+    Ok((root, config))
+}
+fn resolve_path_selection(root: &Path, config_path: Option<&Path>) -> Result<(PathBuf, Config)> {
+    let invocation_root = kortex_repo::root(root)?;
+    let config = Config::load(&invocation_root, config_path)?;
+    let root = config.resolved_root(&invocation_root)?;
+    Ok((root, config))
+}
 impl Service {
+    /// Select through the same no-Store policy used by administrative callers.
+    pub fn open_selected(selector: Option<&str>, config_path: Option<&Path>) -> Result<Self> {
+        let (root, config) = resolve_selection(selector, config_path)?;
+        let expected_id = kortex_core::id(&["repository", &kortex_core::public_path(&root)]);
+        let service = Self::open_at_root(&root, config)?;
+        if service.snapshot.repo_id != expected_id {
+            return Err(Error::new(
+                "REPO_FORBIDDEN",
+                "selection/index identity mismatch",
+                8,
+            ));
+        }
+        Ok(service)
+    }
+    /// Reopen exactly an authorized registered identity. Configuration may not redirect it.
+    pub fn open_registered(
+        repo_id: &str,
+        authorized_root: &Path,
+        config_path: Option<&Path>,
+    ) -> Result<Self> {
+        let (root, config) = resolve_registered_selection(repo_id, authorized_root, config_path)?;
+        let service = Self::open_at_root(&root, config)?;
+        if service.snapshot.repo_id != repo_id {
+            return Err(Error::new(
+                "REPO_FORBIDDEN",
+                "registry/index identity mismatch",
+                8,
+            ));
+        }
+        Ok(service)
+    }
     pub fn open(root: &Path) -> Result<Self> {
         Self::open_with_config(root, None)
     }
     pub fn open_with_config(root: &Path, config_path: Option<&Path>) -> Result<Self> {
-        let invocation_root = kortex_repo::root(root)?;
-        let config = Config::load(&invocation_root, config_path)?;
-        let root = config.resolved_root(&invocation_root)?;
+        let (root, config) = resolve_path_selection(root, config_path)?;
         Self::open_at_root(&root, config)
     }
     /// Use an already resolved root/config without reapplying relocation or Git expansion.
     pub fn open_at_root(root: &Path, config: Config) -> Result<Self> {
-        config.validate()?;
-        let root = root.canonicalize()?;
-        if !root.is_dir() || root.to_str().is_none() {
-            return Err(Error::new(
-                "PATH_REFUSED",
-                "effective root must be a UTF-8 directory",
-                8,
-            ));
-        }
-        let store = Store::open_with_storage(&root, &config.index.storage, false)?;
+        let (root, store) = open_store_at_root(root, &config)?;
         let snapshot = store.load()?;
         if snapshot.root != kortex_core::public_path(&root) {
             return Err(Error::new(
@@ -173,57 +309,76 @@ impl Service {
         })
     }
     pub fn freshness(&self) -> Result<String> {
-        if kortex_repo::inputs::resolution_fingerprint(&self.root) != self.snapshot.resolution_hash
-            || self.config.fingerprint()? != self.snapshot.config_hash
-            || self.snapshot.grammar_hash != kortex_core::PARSER_VERSION
-            || kortex_repo::head(&self.root) != self.snapshot.git_head
-        {
+        let control = RequestControl::new(std::time::Duration::from_millis(
+            self.config.analysis.query_timeout_ms,
+        ))?;
+        self.freshness_with_control(&control)
+    }
+    pub fn freshness_with_control(&self, control: &RequestControl) -> Result<String> {
+        if !execution::freshness_header(
+            &self.root,
+            &self.config,
+            execution::FreshnessHeader {
+                resolution_hash: &self.snapshot.resolution_hash,
+                config_hash: &self.snapshot.config_hash,
+                grammar_hash: &self.snapshot.grammar_hash,
+                git_head: &self.snapshot.git_head,
+            },
+            control,
+        )? {
             return Ok("stale".into());
         }
-        let inv = kortex_repo::discover(&self.root, &self.config)?;
-        let before: Vec<_> = self
-            .snapshot
-            .files
-            .iter()
-            .map(|f| (&f.path, &f.content_hash))
-            .collect();
-        let after: Vec<_> = inv
-            .files
-            .iter()
-            .map(|f| (&f.path, &f.content_hash))
-            .collect();
-        Ok(if before == after { "fresh" } else { "stale" }.into())
+        execution::freshness_files(
+            &self.root,
+            &self.config,
+            self.snapshot
+                .files
+                .iter()
+                .map(|f| (f.path.as_str(), f.content_hash.as_str())),
+            control,
+        )
     }
     pub fn lookup(&self, selector: &str) -> Result<&Symbol> {
-        let mut found: Vec<_> = self
-            .snapshot
-            .symbols()
-            .filter(|s| {
-                s.symbol_id == selector || s.qualified_name == selector || s.name == selector
-            })
-            .collect();
+        let control = RequestControl::new(std::time::Duration::from_millis(
+            self.config.analysis.query_timeout_ms,
+        ))?;
+        self.lookup_with_control(selector, &control)
+    }
+    pub fn lookup_with_control(&self, selector: &str, control: &RequestControl) -> Result<&Symbol> {
+        let mut found = vec![];
+        for s in self.snapshot.symbols() {
+            control.check()?;
+            if s.symbol_id == selector || s.qualified_name == selector || s.name == selector {
+                found.push(s);
+            }
+        }
         if found.is_empty()
             && let Some((path, name)) = selector.rsplit_once(':')
         {
-            if let Ok(line) = name.parse::<usize>() {
-                found = self
-                    .snapshot
-                    .symbols()
-                    .filter(|s| {
-                        s.file_path == path
-                            && s.span.start_line <= line
-                            && s.span.end_line >= line
-                            && s.kind != "file"
-                    })
-                    .collect();
-                found.sort_by_key(|s| s.span.end_byte - s.span.start_byte);
+            let line = name.parse::<usize>().ok();
+            for s in self.snapshot.symbols() {
+                control.check()?;
+                if s.file_path == path
+                    && match line {
+                        Some(line) => {
+                            s.span.start_line <= line && s.span.end_line >= line && s.kind != "file"
+                        }
+                        None => s.name == name || s.qualified_name == name,
+                    }
+                {
+                    found.push(s);
+                }
+            }
+            if line.is_some() {
+                kortex_search::sort_with_control(
+                    &mut found,
+                    |a, b| {
+                        (a.span.end_byte - a.span.start_byte)
+                            .cmp(&(b.span.end_byte - b.span.start_byte))
+                    },
+                    control,
+                )?;
                 found.truncate(1);
-            } else {
-                found = self
-                    .snapshot
-                    .symbols()
-                    .filter(|s| s.file_path == path && (s.name == name || s.qualified_name == name))
-                    .collect();
             }
         }
         match found.as_slice() {
@@ -238,6 +393,23 @@ impl Service {
                 4,
             )),
         }
+    }
+    fn matching_edges(
+        &self,
+        control: &RequestControl,
+        predicate: impl Fn(&kortex_core::Edge) -> bool,
+    ) -> Result<Vec<&kortex_core::Edge>> {
+        let mut edges = vec![];
+        for edge in &self.snapshot.edges {
+            control.check()?;
+            if predicate(edge) {
+                edges.push(edge);
+                if edges.len() == 501 {
+                    break;
+                }
+            }
+        }
+        Ok(edges)
     }
     fn limits(&self, args: &Value) -> Result<Limits> {
         let depth = number(args, "depth", self.config.analysis.default_depth)?;
@@ -260,47 +432,88 @@ impl Service {
         })
     }
     pub fn execute(&self, operation: &str, args: &Value) -> Result<Value> {
-        let started = Instant::now();
-        contracts::validate_input(operation, args)?;
-        let timeout = number(
-            args,
-            "timeout_ms",
-            self.config.analysis.query_timeout_ms as usize,
-        )? as u64;
-        if timeout > self.config.analysis.query_timeout_ms {
+        let control = RequestControl::new(std::time::Duration::from_millis(
+            self.config.analysis.query_timeout_ms,
+        ))?;
+        self.execute_with_control(operation, args, &control)
+    }
+    /// Cooperative control shared with transports and all interruptible analysis loops.
+    /// Kernel I/O, SQLite statements and individual native operators remain indivisible.
+    pub fn execute_with_control(
+        &self,
+        operation: &str,
+        args: &Value,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        self.execute_inner(operation, args, None, control)
+    }
+    /// Explicit SDK opt-in with a real, configured local provider. Transport defaults remain
+    /// gated until the owner approves pretrained artifacts and relevance acceptance.
+    /// All shared freshness, schema, cursor, deadline and output-budget semantics still apply.
+    pub fn execute_with_local_model(
+        &self,
+        args: &Value,
+        provider: &mut dyn kortex_search::hybrid::LocalEmbedder,
+        cache: &mut kortex_search::hybrid::EmbeddingCache,
+    ) -> Result<Value> {
+        let control = RequestControl::new(std::time::Duration::from_millis(
+            self.config.analysis.query_timeout_ms,
+        ))?;
+        self.execute_with_local_model_and_control(args, provider, cache, &control)
+    }
+    pub fn execute_with_local_model_and_control(
+        &self,
+        args: &Value,
+        provider: &mut dyn kortex_search::hybrid::LocalEmbedder,
+        cache: &mut kortex_search::hybrid::EmbeddingCache,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        control.check()?;
+        if self.config.search.embeddings != "local" {
             return Err(Error::new(
-                "QUERY_LIMIT",
-                "timeout exceeds repository policy",
-                2,
+                "LOCAL_MODEL_GATE",
+                "trusted local-model configuration is required",
+                7,
             ));
         }
-        let deadline = started + std::time::Duration::from_millis(timeout);
-        if args
-            .get("generation_id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id != self.snapshot.generation_id)
+        let manifest = kortex_search::hybrid::read_manifest(
+            Path::new(&self.config.search.model_path),
+            &self.config.search.model_checksum,
+        )?;
+        if &manifest != provider.model().manifest()
+            || manifest.revision != self.config.search.model_version
         {
             return Err(Error::new(
-                "GENERATION_MISMATCH",
-                "requested generation is not the pinned reader generation",
+                "INVALID_LOCAL_MODEL",
+                "provider differs from the configured manifest/revision",
                 2,
             ));
         }
-        let freshness = self.freshness()?;
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "freshness check exceeded query deadline",
-                9,
-            ));
-        }
+        control.check()?;
+        self.execute_inner("query", args, Some((provider, cache)), control)
+    }
+    fn execute_inner(
+        &self,
+        operation: &str,
+        args: &Value,
+        local: Option<(
+            &mut dyn kortex_search::hybrid::LocalEmbedder,
+            &mut kortex_search::hybrid::EmbeddingCache,
+        )>,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        let context = contracts::CursorContext::from(self);
+        let (started, control) = execution::prepare(&context, operation, args, control)?;
+        let deadline = control.deadline();
+        let freshness = self.freshness_with_control(&control)?;
+        control.check()?;
         if args.get("require_fresh").and_then(Value::as_bool) == Some(true) && freshness != "fresh"
         {
             return Err(Error::new("STALE_INDEX", "reindex before querying", 5));
         }
         let mut truncated = false;
         let mut next_cursor = None;
-        let mut data = match operation {
+        let data = match operation {
             "status" => {
                 json!({"root":self.snapshot.root,"files":self.snapshot.files.len(),"symbols":self.snapshot.symbols().count(),"edges":self.snapshot.edges.len(),"git_head":self.snapshot.git_head,"diagnostics":self.snapshot.diagnostics,"parser_diagnostics":self.snapshot.files.iter().flat_map(|f|&f.diagnostics).collect::<Vec<_>>(),"integrity":self.store.integrity()?})
             }
@@ -311,13 +524,14 @@ impl Service {
                     .get("path_prefix")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let mut files: Vec<_> = self
-                    .snapshot
-                    .files
-                    .iter()
-                    .filter(|file| file.path.starts_with(prefix))
-                    .collect();
-                files.sort_by(|a, b| a.path.cmp(&b.path));
+                let mut files = vec![];
+                for file in &self.snapshot.files {
+                    control.check()?;
+                    if file.path.starts_with(prefix) {
+                        files.push(file);
+                    }
+                }
+                kortex_search::sort_with_control(&mut files, |a, b| a.path.cmp(&b.path), &control)?;
                 let more = files.len() > offset.saturating_add(limit);
                 let items: Vec<_> = files.into_iter().skip(offset).take(limit).map(|file|json!({"path":file.path,"language":file.language,"size_bytes":file.size_bytes,"content_hash":file.content_hash})).collect();
                 if more {
@@ -331,10 +545,10 @@ impl Service {
                 json!({"items":items})
             }
             "query" => {
-                if self.config.search.embeddings != "disabled" {
+                if self.config.search.embeddings != "disabled" && local.is_none() {
                     return Err(Error::new(
                         "LOCAL_MODEL_GATE",
-                        "local inference is experimental and transport integration is gated on dependency audit and pretrained-artifact acceptance; set search.embeddings=disabled for keyword queries",
+                        "local inference is experimental and automatic transport activation is gated on pretrained-artifact and relevance acceptance; use explicit SDK provider integration or set search.embeddings=disabled",
                         7,
                     ));
                 }
@@ -345,64 +559,77 @@ impl Service {
                     kind: args.get("kind").and_then(Value::as_str),
                     path_prefix: args.get("path_prefix").and_then(Value::as_str),
                 };
-                let (hits, more) = kortex_search::query_filtered(
-                    &self.store,
-                    &self.snapshot,
-                    string(args, "text")?,
-                    limit,
-                    offset,
-                    &filters,
-                )?;
+                let (hits, more, retrieval) = if let Some((provider, cache)) = local {
+                    let result = kortex_search::retrieval::query_hybrid_with_control(
+                        &self.store,
+                        &self.snapshot,
+                        string(args, "text")?,
+                        provider,
+                        cache,
+                        &kortex_search::retrieval::HybridOptions {
+                            filters,
+                            limit,
+                            offset,
+                            deadline,
+                            weights: kortex_search::hybrid::RankingWeights {
+                                lexical: self.config.search.keyword_weight,
+                                vector: self.config.search.vector_weight,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        &control,
+                    )?;
+                    let retrieval = json!({"algorithm":result.algorithm,"model_fingerprint":result.model_fingerprint,"model_id":result.model_id,"model_revision":result.model_revision,"candidates_examined":result.candidates_examined,"experimental":true,"pretrained_quality_accepted":false});
+                    (result.items, result.more, Some((retrieval, result.partial)))
+                } else {
+                    let (hits, more) = kortex_search::query_filtered_with_control(
+                        &self.store,
+                        &self.snapshot,
+                        string(args, "text")?,
+                        limit,
+                        offset,
+                        &filters,
+                        &control,
+                    )?;
+                    (hits, more, None)
+                };
                 if more {
                     next_cursor = Some(contracts::cursor(self, operation, args, offset + limit));
                 }
-                json!({"items":hits})
+                let mut data = json!({"items":hits});
+                if let Some((retrieval, partial)) = retrieval {
+                    data["retrieval"] = retrieval;
+                    data["partial"] = json!(partial);
+                }
+                data
             }
             "context" => {
-                let symbol = self.lookup(string(args, "symbol")?)?;
-                let callers: Vec<_> = self
-                    .snapshot
-                    .edges
-                    .iter()
-                    .filter(|e| {
-                        e.target_id.as_deref() == Some(&symbol.symbol_id) && e.kind == "CALLS"
-                    })
-                    .take(501)
-                    .collect();
-                let callees: Vec<_> = self
-                    .snapshot
-                    .edges
-                    .iter()
-                    .filter(|e| e.source_id == symbol.symbol_id && e.kind == "CALLS")
-                    .take(501)
-                    .collect();
+                let symbol = self.lookup_with_control(string(args, "symbol")?, &control)?;
+                let callers = self.matching_edges(&control, |e| {
+                    e.target_id.as_deref() == Some(&symbol.symbol_id) && e.kind == "CALLS"
+                })?;
+                let callees = self.matching_edges(&control, |e| {
+                    e.source_id == symbol.symbol_id && e.kind == "CALLS"
+                })?;
                 truncated = callers.len() > 500 || callees.len() > 500;
-                let references: Vec<_> = self
-                    .snapshot
-                    .edges
-                    .iter()
-                    .filter(|e| {
-                        e.target_id.as_deref() == Some(&symbol.symbol_id) && e.kind == "REFERENCES"
-                    })
-                    .take(501)
-                    .collect();
-                let types: Vec<_> = self
-                    .snapshot
-                    .edges
-                    .iter()
-                    .filter(|e| e.source_id == symbol.symbol_id && e.kind == "USES_TYPE")
-                    .take(501)
-                    .collect();
-                let associations = kortex_graph::traverse(
+                let references = self.matching_edges(&control, |e| {
+                    e.target_id.as_deref() == Some(&symbol.symbol_id) && e.kind == "REFERENCES"
+                })?;
+                let types = self.matching_edges(&control, |e| {
+                    e.source_id == symbol.symbol_id && e.kind == "USES_TYPE"
+                })?;
+                let associations = kortex_graph::traverse_with_control(
                     &self.snapshot,
                     &symbol.symbol_id,
                     Direction::Upstream,
                     &self.limits(args)?,
                     false,
+                    &control,
                 )?;
                 truncated |= references.len() > 500 || types.len() > 500 || associations.truncated;
                 let test_associations =
-                    test_map::associations(self, &associations.items, deadline)?;
+                    test_map::associations(self, &associations.items, &control)?;
                 let tests: Vec<_> = test_associations
                     .iter()
                     .filter_map(|r| {
@@ -414,24 +641,25 @@ impl Service {
                 json!({"symbol":symbol,"owner":symbol.owner_id.as_deref().and_then(|id|self.snapshot.symbol(id)),"callers":callers.into_iter().take(500).collect::<Vec<_>>(),"callees":callees.into_iter().take(500).collect::<Vec<_>>(),"tests":tests,"references":references.into_iter().take(500).collect::<Vec<_>>(),"types":types.into_iter().take(500).collect::<Vec<_>>(),"test_associations":test_associations})
             }
             "impact" => {
-                let target = self.lookup(string(args, "symbol")?)?;
+                let target = self.lookup_with_control(string(args, "symbol")?, &control)?;
                 let limits = self.limits(args)?;
                 let direction = Direction::parse(
                     args.get("direction")
                         .and_then(Value::as_str)
                         .unwrap_or("upstream"),
                 )?;
-                let t = kortex_graph::traverse(
+                let t = kortex_graph::traverse_with_control(
                     &self.snapshot,
                     &target.symbol_id,
                     direction,
                     &limits,
                     false,
+                    &control,
                 )?;
                 truncated = t.truncated;
                 let direct = t.items.iter().filter(|i| i.depth == 1).count();
                 let indirect = t.items.len() - direct;
-                let associations = test_map::associations(self, &t.items, deadline)?;
+                let associations = test_map::associations(self, &t.items, &control)?;
                 let mut likely_test_associations = associations;
                 for reach in &t.items {
                     if self
@@ -461,15 +689,16 @@ impl Service {
                 json!({"target":target,"risk":if t.items.len()>100{"high"}else if t.items.len()>10{"medium"}else{"low"},"risk_is_heuristic":true,"direct":direct,"indirect":indirect,"partial":t.ambiguous_relationships>0 || t.unresolved_relationships>0,"traversal":t,"symbols":symbols,"likely_tests":tests,"likely_test_associations":likely_test_associations})
             }
             "trace" => {
-                let from = self.lookup(string(args, "from")?)?;
-                let to = self.lookup(string(args, "to")?)?;
+                let from = self.lookup_with_control(string(args, "from")?, &control)?;
+                let to = self.lookup_with_control(string(args, "to")?, &control)?;
                 let limits = self.limits(args)?;
-                let t = kortex_graph::traverse(
+                let t = kortex_graph::traverse_with_control(
                     &self.snapshot,
                     &from.symbol_id,
                     Direction::Downstream,
                     &limits,
                     false,
+                    &control,
                 )?;
                 let path = if from.symbol_id == to.symbol_id {
                     Some(vec![])
@@ -488,13 +717,14 @@ impl Service {
                 json!({"from":from,"to":to,"found":path.is_some(),"path":path,"search_bounded":true,"partial":t.ambiguous_relationships>0 || t.unresolved_relationships>0})
             }
             "graph" => {
-                let target = self.lookup(string(args, "symbol")?)?;
-                let t = kortex_graph::traverse(
+                let target = self.lookup_with_control(string(args, "symbol")?, &control)?;
+                let t = kortex_graph::traverse_with_control(
                     &self.snapshot,
                     &target.symbol_id,
                     Direction::Both,
                     &self.limits(args)?,
                     true,
+                    &control,
                 )?;
                 truncated = t.truncated;
                 let mut nodes = vec![target];
@@ -506,124 +736,66 @@ impl Service {
                 nodes.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
                 json!({"nodes":nodes,"edges":t.edges,"partial":t.ambiguous_relationships>0 || t.unresolved_relationships>0,"ambiguous_relationships":t.ambiguous_relationships,"unresolved_relationships":t.unresolved_relationships})
             }
-            "changes" => self.changes(args)?,
+            "changes" => self.change_analysis(args, &control)?,
             "routes" => {
-                let result = intelligence::discover(self, args, deadline)?;
+                let result = intelligence::discover(self, args, &control)?;
                 let (result, cursor) = intelligence::paginate(self, args, result)?;
                 next_cursor = cursor;
                 result
             }
-            "check" => rules::evaluate(self, args, deadline)?,
+            "check" => rules::evaluate(self, args, &control)?,
             _ => return Err(Error::new("UNKNOWN_OPERATION", operation, 2)),
         };
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "operation exceeded query deadline",
-                9,
-            ));
-        }
-        data["schema_version"] = json!("1.0");
-        data["operation"] = json!(operation);
-        if operation == "check" && freshness != "fresh" {
-            data["complete"] = json!(false);
-            data["passed"] = json!(false);
-            data["partial"] = json!(true);
-            if data["exit_code"] == 0 {
-                data["exit_code"] = json!(7);
-            }
-        }
-        truncated |= data["truncated"].as_bool().unwrap_or(false);
-        let partial = data["partial"].as_bool().unwrap_or(false)
-            || self
-                .snapshot
-                .files
-                .iter()
-                .any(|f| !f.diagnostics.is_empty())
-            || self
-                .snapshot
-                .diagnostics
-                .iter()
-                .any(|s| s.contains("truncated") || s.contains("refused"));
-        let mut warnings = if freshness == "fresh" {
-            vec![]
-        } else {
-            vec!["Index does not match repository state; citations refer to indexed generation."]
-        };
-        if operation == "changes"
-            && let Some(items) = data["warnings"].as_array()
-        {
-            warnings.extend(items.iter().filter_map(Value::as_str));
-        }
-        let request_id = hash(format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let mut response = json!({"schema_version":"1.0","request_id":request_id,"repo_id":self.snapshot.repo_id,"generation_id":self.snapshot.generation_id,"index_status":freshness,"partial":partial,"truncated":truncated,"warnings":warnings,"data":data,"page":{"next_cursor":next_cursor},"timing_ms":started.elapsed().as_millis()});
-        let budget = number(
+        execution::finish(
+            &context,
+            operation,
             args,
-            "max_response_bytes",
-            self.config.mcp.max_response_bytes,
-        )?;
-        if budget > self.config.mcp.max_response_bytes {
-            return Err(Error::new(
-                "QUERY_LIMIT",
-                "response budget exceeds repository policy",
-                2,
-            ));
-        }
-        while serde_json::to_vec(&response)?.len() > budget {
-            if !matches!(operation, "query" | "routes" | "files")
-                || response["data"]["items"]
-                    .as_array()
-                    .is_none_or(|items| items.len() <= 1)
-            {
-                return Err(Error::new(
-                    "RESPONSE_BUDGET",
-                    "response exceeds byte budget; narrow the query or reduce limit/depth",
-                    7,
-                ));
-            }
-            let items = response["data"]["items"].as_array_mut().unwrap();
-            items.pop();
-            let count = items.len();
-            response["page"]["next_cursor"] = json!(contracts::cursor(
-                self,
-                operation,
-                args,
-                contracts::cursor_offset(self, operation, args)? + count
-            ));
-            response["truncated"] = json!(true);
-            if Instant::now() >= deadline {
-                return Err(Error::new(
-                    "QUERY_TIMEOUT",
-                    "response encoding exceeded deadline",
-                    9,
-                ));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "response encoding exceeded deadline",
-                9,
-            ));
-        }
-        Ok(response)
+            execution::ResponseParts {
+                started,
+                freshness,
+                indexed_partial: self
+                    .snapshot
+                    .files
+                    .iter()
+                    .any(|f| !f.diagnostics.is_empty())
+                    || self
+                        .snapshot
+                        .diagnostics
+                        .iter()
+                        .any(|s| s.contains("truncated") || s.contains("refused")),
+                truncated,
+                next_cursor,
+                data,
+            },
+            &control,
+        )
     }
+    #[cfg(test)]
     fn changes(&self, args: &Value) -> Result<Value> {
-        self.change_analysis(args)
+        let control = RequestControl::new(std::time::Duration::from_millis(
+            self.config.analysis.query_timeout_ms,
+        ))?;
+        self.change_analysis(args, &control)
     }
 }
-fn commit(root: &Path, reference: &str) -> Result<String> {
+fn open_store_at_root(root: &Path, config: &Config) -> Result<(PathBuf, Store)> {
+    config.validate()?;
+    let root = root.canonicalize()?;
+    if !root.is_dir() || root.to_str().is_none() {
+        return Err(Error::new(
+            "PATH_REFUSED",
+            "effective root must be a UTF-8 directory",
+            8,
+        ));
+    }
+    let store = Store::open_with_storage(&root, &config.index.storage, false)?;
+    Ok((root, store))
+}
+fn commit(root: &Path, reference: &str, control: &RequestControl) -> Result<String> {
     if reference.len() > 1024 {
         return Err(Error::new("INVALID_REF", "reference too long", 2));
     }
-    Ok(kortex_repo::git(
+    Ok(kortex_repo::git_with_control(
         root,
         &[
             "rev-parse",
@@ -631,6 +803,7 @@ fn commit(root: &Path, reference: &str) -> Result<String> {
             "--end-of-options",
             &format!("{reference}^{{commit}}"),
         ],
+        control,
     )?
     .trim()
     .into())

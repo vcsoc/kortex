@@ -1,12 +1,9 @@
 //! Explicit architecture policy evaluated only against indexed dependency evidence.
 use crate::Service;
-use kortex_core::{Edge, Error, Result, Symbol};
+use kortex_core::{Edge, Error, RequestControl, Result, Symbol};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const DEPENDENCIES: &[&str] = &[
     "CALLS",
@@ -155,7 +152,8 @@ fn matches(selector: &Selector, symbol: &Symbol) -> bool {
     path_matches(&selector.path, &symbol.file_path)
         && (selector.kinds.is_empty() || selector.kinds.contains(&symbol.kind))
 }
-pub fn evaluate(service: &Service, args: &Value, deadline: Instant) -> Result<Value> {
+pub fn evaluate(service: &Service, args: &Value, control: &RequestControl) -> Result<Value> {
+    control.check()?;
     let mut policy = args.clone();
     if let Some(object) = policy.as_object_mut() {
         for common in [
@@ -198,17 +196,18 @@ pub fn evaluate(service: &Service, args: &Value, deadline: Instant) -> Result<Va
         validate_selector(&rule.from)?;
         validate_selector(&rule.to)?;
     }
-    let symbols: BTreeMap<_, _> = service
-        .snapshot
-        .symbols()
-        .map(|s| (s.symbol_id.as_str(), s))
-        .collect();
+    let mut symbols = BTreeMap::new();
+    for symbol in service.snapshot.symbols() {
+        control.check()?;
+        symbols.insert(symbol.symbol_id.as_str(), symbol);
+    }
     let mut adjacency: BTreeMap<&str, Vec<&Edge>> = BTreeMap::new();
     for edge in &service.snapshot.edges {
+        control.check()?;
         adjacency.entry(&edge.source_id).or_default().push(edge);
     }
     for edges in adjacency.values_mut() {
-        edges.sort_by(|a, b| a.id.cmp(&b.id));
+        kortex_search::sort_with_control(edges, |a, b| a.id.cmp(&b.id), control)?;
     }
     let mut violations = vec![];
     let mut uncertain = BTreeMap::new();
@@ -219,19 +218,17 @@ pub fn evaluate(service: &Service, args: &Value, deadline: Instant) -> Result<Va
         let start_steps = steps;
         let start_uncertain = uncertain.len();
         let mut sources_examined = 0;
-        for source in symbols.values().filter(|s| matches(&rule.from, s)) {
+        for source in symbols.values() {
+            control.check()?;
+            if !matches(&rule.from, source) {
+                continue;
+            }
             sources_examined += 1;
             let mut queue =
                 VecDeque::from([(source.symbol_id.as_str(), Vec::<&Edge>::new(), 1.0_f64)]);
             let mut seen = BTreeSet::from([source.symbol_id.as_str()]);
             while let Some((node, path, confidence)) = queue.pop_front() {
-                if Instant::now() >= deadline {
-                    return Err(Error::new(
-                        "QUERY_TIMEOUT",
-                        "architecture check deadline exceeded",
-                        9,
-                    ));
-                }
+                control.check()?;
                 if path.len() >= rule.max_depth {
                     continue;
                 }
@@ -241,6 +238,7 @@ pub fn evaluate(service: &Service, args: &Value, deadline: Instant) -> Result<Va
                     .flatten()
                     .filter(|e| rule.edge_kinds.contains(&e.kind))
                 {
+                    control.check()?;
                     steps += 1;
                     if steps > 1_000_000 {
                         truncated = true;

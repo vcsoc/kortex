@@ -1,19 +1,122 @@
 //! Descriptor/handle-relative reads: canonicalization alone is not a confinement boundary.
 use kortex_core::{Error, Result};
-use std::{fs::File, path::Path};
+use std::{fs::File, io::Read, path::Path};
+
+#[cfg(test)]
+type ReadHook = Option<Box<dyn FnMut(usize)>>;
+#[cfg(test)]
+std::thread_local! {
+    // Inject cancellation only AFTER a real native read, on the calling test's
+    // thread. No hook exists in production builds or other concurrently run tests.
+    pub(crate) static READ_HOOK: std::cell::RefCell<ReadHook> = std::cell::RefCell::new(None);
+}
+
+/// Shared byte-read path, also exercised after deterministic resolution/open swaps.
+pub(crate) fn read_bytes(root: &Path, canonical: &Path, max: u64) -> Result<Vec<u8>> {
+    read_bytes_with_control(root, canonical, max, None)
+}
+
+pub(crate) fn read_bytes_with_control(
+    root: &Path,
+    canonical: &Path,
+    max: u64,
+    control: Option<&kortex_core::RequestControl>,
+) -> Result<Vec<u8>> {
+    crate::checkpoint(control)?;
+    let file = open(root, canonical)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::new("PATH_REFUSED", "not a regular file", 8));
+    }
+    read_opened_bytes(file, max, control)
+}
+
+pub(crate) fn read_opened_bytes(
+    file: File,
+    max: u64,
+    control: Option<&kortex_core::RequestControl>,
+) -> Result<Vec<u8>> {
+    read_opened_bytes_counted(file, max, control, &mut crate::ConfinedReadStats::default())
+}
+
+pub(crate) fn read_opened_bytes_counted(
+    file: File,
+    max: u64,
+    control: Option<&kortex_core::RequestControl>,
+    stats: &mut crate::ConfinedReadStats,
+) -> Result<Vec<u8>> {
+    let mut reader = file.take(max.saturating_add(1));
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        crate::checkpoint(control)?;
+        stats.read_calls += 1;
+        let count = match reader.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        stats.bytes_read += count as u64;
+        crate::checkpoint(control)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        #[cfg(test)]
+        READ_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(count);
+            }
+        });
+    }
+    if bytes.len() as u64 > max {
+        return Err(Error::new(
+            "FILE_TOO_LARGE",
+            "file exceeds configured size limit",
+            7,
+        ));
+    }
+    Ok(bytes)
+}
 #[cfg(unix)]
 pub(crate) fn open(root: &Path, canonical: &Path) -> Result<File> {
-    use rustix::fs::{Mode, OFlags, open, openat};
+    use rustix::fs::{Mode, OFlags, open};
     let relative = canonical
         .strip_prefix(root)
         .map_err(|_| Error::new("PATH_REFUSED", "path escaped root", 8))?;
+    let directory = File::from(
+        open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    open_anchored(&directory, relative)
+}
+
+#[cfg(unix)]
+pub(crate) fn open_anchored(root: &File, relative: &Path) -> Result<File> {
+    open_anchored_impl(root, relative, None)
+}
+
+#[cfg(unix)]
+pub(crate) fn open_anchored_with_parents(
+    root: &File,
+    relative: &Path,
+) -> Result<(File, Vec<std::fs::Metadata>)> {
+    let mut parents = Vec::new();
+    let file = open_anchored_impl(root, relative, Some(&mut parents))?;
+    Ok((file, parents))
+}
+
+#[cfg(unix)]
+fn open_anchored_impl(
+    root: &File,
+    relative: &Path,
+    mut parents: Option<&mut Vec<std::fs::Metadata>>,
+) -> Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
     let mut components = relative.components().peekable();
-    let mut directory = open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
+    let mut directory: Option<File> = None;
     while let Some(component) = components.next() {
         if !matches!(component, std::path::Component::Normal(_)) {
             return Err(Error::new("PATH_REFUSED", "non-normal confined path", 8));
@@ -22,18 +125,27 @@ pub(crate) fn open(root: &Path, canonical: &Path) -> Result<File> {
         if components.peek().is_some() {
             flags |= OFlags::DIRECTORY;
         }
-        let next =
-            openat(&directory, component.as_os_str(), flags, Mode::empty()).map_err(|error| {
-                Error::new(
-                    "PATH_REFUSED",
-                    format!("path changed or became inaccessible during confined read: {error}"),
-                    8,
-                )
-            })?;
+        let next = openat(
+            directory.as_ref().unwrap_or(root),
+            component.as_os_str(),
+            flags,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            Error::new(
+                "PATH_REFUSED",
+                format!("path changed or became inaccessible during confined read: {error}"),
+                8,
+            )
+        })?;
         if components.peek().is_none() {
             return Ok(File::from(next));
         }
-        directory = next;
+        let next = File::from(next);
+        if let Some(parents) = parents.as_mut() {
+            parents.push(next.metadata()?);
+        }
+        directory = Some(next);
     }
     Err(Error::new(
         "PATH_REFUSED",
@@ -43,8 +155,15 @@ pub(crate) fn open(root: &Path, canonical: &Path) -> Result<File> {
 }
 #[cfg(windows)]
 pub(crate) fn open(root: &Path, canonical: &Path) -> Result<File> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-    use cap_std::fs::{Dir, OpenOptions};
+    let directory = windows_root(root)?;
+    let relative = canonical
+        .strip_prefix(root)
+        .map_err(|_| Error::new("PATH_REFUSED", "path escaped root", 8))?;
+    windows_open(&directory, relative)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_root(root: &Path) -> Result<cap_std::fs::Dir> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -58,26 +177,9 @@ pub(crate) fn open(root: &Path, canonical: &Path) -> Result<File> {
             8,
         )
     };
-    let relative = canonical
-        .strip_prefix(root)
-        .map_err(|_| Error::new("PATH_REFUSED", "path escaped root", 8))?;
-    if relative.as_os_str().is_empty()
-        || relative.components().any(|component| {
-            !matches!(component, std::path::Component::Normal(_))
-                || component.as_os_str().to_str().is_none_or(|name| {
-                    // NTFS streams are not source paths. Reject Win32 aliases whose
-                    // normalization could hide a device name or change identity.
-                    name.contains(':') || name.ends_with(['.', ' '])
-                })
-        })
-    {
-        return Err(Error::new("PATH_REFUSED", "non-normal confined path", 8));
-    }
-
-    // Do not follow a root replaced with a junction/symlink. Omitting SHARE_DELETE
-    // is required by Dir::from_std_file: the anchor cannot be renamed/deleted
-    // while cap-std resolves children. The root and its initial ancestors are
-    // trusted input, as on Unix; children are never opened by an ambient path.
+    // No SHARE_DELETE: cap-std's source anchor cannot be renamed/deleted while
+    // resolving children. Initial ancestors are trusted, as on Unix. This is
+    // source confinement, NOT private derived-data ACL enforcement.
     let anchor = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -92,7 +194,31 @@ pub(crate) fn open(root: &Path, canonical: &Path) -> Result<File> {
             8,
         ));
     }
-    let directory = Dir::from_std_file(anchor);
+    Ok(cap_std::fs::Dir::from_std_file(anchor))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_open(directory: &cap_std::fs::Dir, relative: &Path) -> Result<File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::OpenOptions;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let refused = |error: std::io::Error| {
+        Error::new("PATH_REFUSED", format!("confined open failed: {error}"), 8)
+    };
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            !matches!(component, std::path::Component::Normal(_))
+                || component.as_os_str().to_str().is_none_or(|name| {
+                    // NTFS streams are not source paths. Reject Win32 aliases whose
+                    // normalization could hide a device name or change identity.
+                    name.contains(':') || name.ends_with(['.', ' '])
+                })
+        })
+    {
+        return Err(Error::new("PATH_REFUSED", "non-normal confined path", 8));
+    }
+
     // cap-std walks components with handle-relative NtCreateFile, manually
     // resolves parent reparse points within the anchor, and denies device names.
     // Canonical aliases resolved by the caller still work. A replaced final

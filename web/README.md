@@ -26,8 +26,11 @@ there are no CDNs, remote fonts, telemetry or embedding calls.
 
 Rust snapshots the prebuilt directory at startup through the shared confined
 regular-file reader. Bounds: 512 entries, eight directory levels, 2 MiB/file,
-16 MiB total. Current accepted assets are UTF-8 HTML/JS/MJS/CSS/JSON/SVG/TXT;
-binary assets await a shared confined-byte reader. Symlinks, special files,
+16 MiB total. Accepted text assets are UTF-8 HTML/JS/MJS/CSS/JSON/SVG/TXT;
+binary assets are PNG/JPG/JPEG/GIF/WEBP/ICO/WOFF/WOFF2/TTF/OTF. Binary bytes
+use the shared confined-byte reader unchanged (no codec decoding/validation or
+ambient-file fallback). Text still rejects NUL and invalid UTF-8. HEAD lengths
+are byte lengths. Symlinks, special files,
 unsafe names and oversized inventories are refused. Source maps, directory
 listing, traversal and unknown-route SPA fallback are not served. Responses
 set correct MIME, no-store, nosniff, same-origin CORP, restrictive CSP and
@@ -38,7 +41,8 @@ Vite is a build/development tool, not the production delivery server.
 The tree lists **indexed files**, not arbitrary filesystem paths. API results are
 pinned to the selected index generation. Reload the indexed generation after
 reindexing; a stale cursor/generation is rejected, not silently resumed.
-Graphs request at most 200 nodes, display at most 1,000 edges, and preserve the
+Graphs have an explicit 1..200 traversal-node control, display at most 1,000
+edges, and preserve the
 full returned bounded evidence in JSON exports. The indexed file view displays
 at most 1,000 loaded files and supports explicit pagination. Partial/truncated
 results and request IDs remain visible. SVG/PNG represent the loaded bounded
@@ -48,7 +52,8 @@ Keyboard: `/` focuses search, `Esc` cancels outstanding fetches, arrow/Home/End
 keys navigate view tabs. Native file-directory disclosures and a separate graph
 node list provide keyboard navigation equivalent to the canvas. Light/dark and
 mobile layouts are supported. Source comments and names are escaped text, never
-HTML instructions.
+HTML instructions. SVG export additionally replaces XML-1.0-forbidden characters
+and lone UTF-16 surrogates with U+FFFD; valid Unicode (including emoji) is retained.
 
 ## Executable acceptance
 
@@ -72,7 +77,13 @@ repositories, run actual index/CLI/API processes on ephemeral loopback ports and
 consume the production-built UI **served by Rust**, without a Vite server. They
 do not mock API responses or ship fixture
 data into advertised UI paths. Accessibility checks use axe against real loaded
-evidence in light, dark and mobile layouts; these automated checks are not a
+evidence in light, dark and mobile layouts, plus hostile XML-label SVG exports
+and a genuinely indexed 321-function graph with an explicit smaller traversal
+bound. Registered-ID tests use an explicitly configured relocated root, reject
+configuration redirection to another actual indexed repository, and recover
+after restoration. Real API auth refusal and browser AbortSignal/reconnect are
+also covered; browser abort does not prove forced interruption of Rust work.
+These automated checks are not a
 substitute for owner/platform assistive-technology acceptance.
 
 ## Dependencies and provenance

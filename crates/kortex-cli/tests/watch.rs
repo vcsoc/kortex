@@ -1,3 +1,4 @@
+mod support;
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader},
@@ -14,7 +15,7 @@ impl Drop for Guard {
 }
 #[test]
 fn watcher_reconciles_atomic_saves_and_rename_then_survives_kill() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     let root = d.path();
     std::fs::write(root.join("a.py"), "def original(): pass\n").unwrap();
     let binary = env!("CARGO_BIN_EXE_kortex");

@@ -202,6 +202,16 @@ pub fn index_at_root(path: &Path, config: &Config, options: &Options) -> Result<
     }
     if let (Some(store), Some(lock)) = (&mut store, &lock) {
         store.commit(&snapshot, lock)?;
+        if let Some(origin) = &config.origin {
+            kortex_storage::registry::Registry::open()?.register_with_selection(
+                &snapshot,
+                &kortex_storage::registry::RepositorySelection {
+                    invocation_root: origin.invocation_root.clone(),
+                    explicit_config: origin.explicit_config.clone(),
+                    effective_root: root.clone(),
+                },
+            )?;
+        }
     }
     Ok(Report {
         snapshot,

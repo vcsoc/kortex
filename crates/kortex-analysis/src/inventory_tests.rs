@@ -83,6 +83,22 @@ fn impact_includes_persisted_test_kinds_through_reverse_call_graph_without_claim
 }
 #[test]
 fn invocation_config_root_is_resolved_once_and_open_at_root_never_expands_git() {
+    if std::env::var_os("KORTEX_ROOT_ONCE_CHILD").is_none() {
+        let isolated = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "intelligence_tests::inventory::invocation_config_root_is_resolved_once_and_open_at_root_never_expands_git", "--nocapture"])
+            .env("KORTEX_ROOT_ONCE_CHILD", "1")
+            .env("KORTEX_REGISTRY", isolated.path().join("private-registry/registry.db"))
+            .env("XDG_CONFIG_HOME", isolated.path().join("config"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("nested")).unwrap();
     std::fs::write(
@@ -123,10 +139,11 @@ fn shared_cache_child() {
     assert!(service.lookup("cached").is_ok());
     assert!(!root.join(".kortex").exists());
     assert!(
-        service
-            .store
-            .directory
-            .starts_with(std::env::var_os("XDG_CACHE_HOME").unwrap())
+        service.store.directory.starts_with(
+            PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
+                .canonicalize()
+                .unwrap()
+        )
     );
 }
 #[test]
@@ -141,6 +158,10 @@ fn service_reads_the_same_configured_shared_cache_as_the_indexer() {
             "--nocapture",
         ])
         .env("KORTEX_ANALYSIS_CACHE_CHILD_ROOT", &root)
+        .env(
+            "KORTEX_REGISTRY",
+            temp.path().join("private-registry/registry.db"),
+        )
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .output()

@@ -1,4 +1,5 @@
 //! Executable checks for filter, freshness, generation and response-budget options.
+mod support;
 use serde_json::Value;
 use std::{fs, path::Path, process::Command};
 fn run(root: &Path, args: &[&str]) -> std::process::Output {
@@ -12,7 +13,7 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
 }
 #[test]
 fn filters_cursors_freshness_generation_and_budgets_reach_the_shared_service() {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     let root = d.path();
     fs::write(root.join(".gitignore"), ".kortex/\nregistry.db*\n").unwrap();
     fs::write(

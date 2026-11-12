@@ -1,4 +1,5 @@
 //! P1 executable CLI and actual MCP SDK contracts, using real indexed source.
+mod support;
 use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command};
@@ -13,7 +14,7 @@ fn command(root: &Path) -> Command {
     c
 }
 fn fixture() -> tempfile::TempDir {
-    let d = tempfile::tempdir().unwrap();
+    let d = support::tempdir().unwrap();
     fs::write(d.path().join(".gitignore"), ".kortex/\nregistry.db*\n").unwrap();
     fs::write(d.path().join("app.py"),"from fastapi import FastAPI\napp = FastAPI()\n\ndef leaf():\n    return True\n\n@app.get('/items')\ndef entry():\n    return leaf()\n\ndef uncertain():\n    return mystery()\n").unwrap();
     let out = command(d.path())

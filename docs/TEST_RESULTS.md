@@ -2,16 +2,48 @@
 
 ## Environment and boundaries
 
-Local Apple M5 Pro / aarch64 macOS 26.5.2, Rust/Cargo 1.99.1. No Windows/Linux test run, hosted CI execution, public push, tag, release, account operation or remote service launch has been performed. The specification and pre-existing `.pi` content are preserved. Git was initialized on main; origin is https://github.com/vcsoc/kortex.git. No commit was requested or made.
+Local Apple M5 Pro / aarch64 macOS 26.5.2, Rust/Cargo 1.99.1. Windows execution remains unavailable. Local Docker Desktop Linux arm64 compilation was attempted with networking disabled; bounded runs timed out before application tests, so no Linux runtime pass is claimed. No hosted CI execution, public push, tag, release, account mutation or remote service launch has been performed. The specification and pre-existing `.pi` content are preserved. Git was initialized on main; origin is https://github.com/vcsoc/kortex.git. No commit was requested or made.
 
-## Current production wave: not accepted complete
+## Latest Integrated Lazy-Query Development Checkpoint
 
-- Parent config/repository/storage verification: **67 scoped tests** and strict native clippy pass. This includes actual P1 extension discovery and the two parent-added writable-artifact regressions. Current full-workspace acceptance and refreshed coverage remain open.
-- Genuine Windows-target storage compilation and strict cross-clippy pass using official Rust 1.99.1 and a checksum-verified local Zig/Clang compiler. Real SQLite output is AMD64 COFF; an intentionally invalid C probe fails normally. Two Windows-only directory-builder lint errors were fixed. This is NOT Windows execution or ACL/privacy acceptance; see `WINDOWS_VALIDATION.md`.
-- Five private-policy regressions, six compiler-adapter unit tests and seven benchmark-orchestration unit tests pass. These unit tests are not substitutes for real application or reference-performance acceptance. The hardened tiny real-binary benchmark self-test also passes.
-- The initial all-feature audit found four new ZIP vulnerabilities and unmaintained `paste` through the embedding backend. Candle was upgraded to 0.11.1 / ZIP 9.5.1; parent reran the locked all-feature audit. ZIP findings are gone, but **audit still FAILS** on RUSTSEC-2024-0436 (`paste` 1.0.15, compile-time proc macro). No suppression or owner health-risk exception has been added. Latest log: `target/production-wave-audit-latest.log`.
-- A reference-sized OLD pre-wave release diagnostic exceeded its 45-second full-index timeout at 10,000 files/100,000 functions. It recorded `runs_complete: false`; no completed reference query/RSS result exists. The smaller 1,000-file diagnostic does not prove scale. See `PRODUCTION_READINESS.md` and the raw `target/scale-baseline-prewave-100k-nonquiescent.json` failure report.
-- Semantic worker runtime reports 49 scoped tests and six real P1 providers; transport checkpoint reports 27 scoped passing tests, one preserved regression and browser files-API failures. Continued implementation and independent integration are separate from those checkpoints. Parent parser cache version is now `tree-sitter-0.25-kortex-7`.
+All four workers completed. Parent resolved original-file-order API integration and corrected a legacy test fixture to remove ALL optional new evidence; a new negative regression retains CORRUPT_INDEX for orphan current projection rows. CLI/MCP/HTTP now invoke shared ReadService dispatch directly: query is genuinely projected; context/impact remain explicit same-Store eager fallback.
+
+Actual rebuilt CLI + `cargo test --workspace --all-features --locked --offline --no-fail-fast -- --include-ignored` with explicit KORTEX_TEST_CLI: **ALL targets PASS, zero ignored**, including analysis59/search23/storage62/repository69, admin regressions and BOTH normally ignored CLI proofs. Strict all-target/all-feature workspace clippy, workspace fmt, all-feature advisory/bans/licenses/sources audit ALL PASS. Logs `target/parent-lazy-integrated-{tests,clippy,format,audit}.log`.
+
+Real100k-function10-sample optimized diagnostic verifies complete eager/lazy response equivalence and no eager query materialization. Lazy open1.63–4.22ms; full lazy execute including freshness697–1830ms; actual CLI wall758–1893ms, CLI RSS61.0–65.4MB. Current latency targets remain NOT met. No universal speedup/reference-percentile/whole-process-memory-improvement claim; full profiler RSS includes eager/fixture generation. Evidence `target/parent-lazy-100k-profile.log`, binary hashes `target/parent-lazy-profile-binaries.sha256`, details `docs/crew-intelligence.md`. Earlier Linux pass below is an older isolated baseline, NOT this newly integrated source. Schema2 default adoption remains prohibited; current coverage/platform/browser/release acceptance still require refresh.
+
+## Corrected Linux Functional Checkpoint
+
+Parent fixed the genuine experimental stamped-read coarse-timestamp mutation blind spot identified by Linux execution: a second bounded read of the actual descriptor compares bytes, with original assertions retained and a new64-write regression. Native repository **69 PASS** and strict clippy PASS. A new immutable snapshot overlays ONLY the completed repository crate onto the prior all-feature development baseline (other active worker changes excluded):162 inputs, SHA256 `e973dd15053442ab11f7945bf5215f261432d4d1a3f7bc24798b3bdf207c4a26`.
+
+Actual offline/nonroot ARM64 Linux VM workspace: **313 passed/0 failed/1 ignored**; explicit ignored six-language CLI journey PASS; extracted private DEBUG CLI archive/install `version/index/query/context/impact/doctor` smoke PASS with actual semantic assertions and executable hashes. Full report `target/local-linux-validation/native-5m9echoq/report.json`, details and preserved initial failure `docs/LINUX_VALIDATION.md`. This is NOT live-head, x86/Windows, release packaging, signing, hardware performance, power-loss or production acceptance.
+
+## Fresh integrated parent verification
+
+After all four workers completed, parent independently ran the stable source:
+
+- `cargo test --workspace --all-features --locked --offline --no-fail-fast`: PASS across all workspace test targets; one CLI-dependent test initially ignored.
+- `KORTEX_TEST_CLI="$PWD/target/debug/kortex" cargo test -p kortex-indexer --test p1_discovery --locked --offline actual_cli_discovery_query_and_context_for_all_six_p1_languages -- --ignored --nocapture`: PASS, actual required test executed (one passed, not zero filtered success).
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`: PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `target/tools/bin/cargo-deny --all-features --locked --offline check`: advisories/bans/licenses/sources ALL PASS, no waivers.
+- Independent `selection_admin` HTTP-feature target: all FOUR regressions PASS unchanged; earlier config-show/corrupt-repair failures are superseded.
+
+Logs: `target/parent-wave-integrated-{tests,clippy,format,audit}.log`, `target/parent-wave-six-language-cli.log`, `target/parent-selection-admin-tests.log`. These are current integrated development checks, NOT full production acceptance, refreshed coverage, reference performance, complete transport lifecycle, pretrained quality or platform/install proof. All four worker sessions are completed; no active worker is implied by their prior launch receipts. Persistent private vector cache and native Darwin ACL implementation are now part of this passing source; general lazy query/context/impact dispatch remains unfinished.
+
+## Prior production-wave checkpoints (superseded where noted)
+
+Canonical current ledger: `docs/PRODUCTION_READINESS.md`; renewed implementation contracts: `docs/NEXT_ENGINEERING_CONTRACT.md`. Counts below are separate checkpoints, NOT a summed integrated-workspace result.
+
+- Parent earlier verified67 config/repository/storage tests and strict native clippy. Later storage checkpoint42 tests, repository30 tests and intelligence130 scoped tests (including retained58 semantic/provider/indexer tests) pass. Fresh full-workspace acceptance/critical coverage remain open. Parser cache stays `tree-sitter-0.25-kortex-7`.
+- Normal registered-ID relocation/provenance is fixed. Latest transport Rust checkpoint39 passes/two preserved `selection_admin.rs` failures: ID config-show and corrupt doctor-repair still lose selected explicit origin. HTTP10/MCP4 scoped tests and strict clippy/fmt pass. TEN actual Rust-served browser journeys, frontend build/format and npm audit pass. Files, impact likely-tests, binary assets and shared graph-schema parity are resolved, not current blockers.
+- Parent ALL-feature locked/offline audit NOW PASSES: advisories, bans, licenses and sources. Maintained tract0.23.10/pastey replaces Candle/tokenizers/paste. No suppression or owner waiver was added. Historical ZIP/paste failure logs retained; current log `target/production-wave-audit-current.log` supersedes them.
+- Intelligence scoped instrumented coverage87.20% across analysis/config/graph/search with72 passing tests, NOT workspace/critical acceptance. Real generated-tensor encoder and independent token-ID conformance pass; pretrained artifacts/relevance and persistent cache acceptance remain missing. Default automatic local model remains gated.
+- Fixed real10k-file/110k-symbol storage diagnostic replacement30.39 ->10.63s, nonquiescent n=1; changed-fact storage-only publication6.88s is a different inert fixture. Query profile still shows eager Snapshot300-600ms and freshness400-1250ms. No reference p95/sample/RSS acceptance; old45s timeout remains historical evidence, not the latest completed diagnostic.
+- Parent private-development archive smoke verifies707 payload hashes, four prebuilt explorer assets,439 Cargo/npm declared inventory records and three exact-commit/checksum grammar notices; extracted executable runs version without Node. This is NOT production/signing/reproducibility/install acceptance. Evidence `target/continuation-package-validation.json`; packaging/harness unit results are not application acceptance.
+- Genuine Windows-target SQLite compile/cross-clippy uses official Rust and verified Zig/Clang, actual AMD64 COFF, intentional invalid-C refusal. Windows runtime/DACL/privacy still unverified. Unix mode placement alone does not establish macOS extended ACL privacy; current helpers need call-site integration and ACL review.
+- Local Linux arm64 pinned-image/nonroot/offline/network-disabled frozen-source builds twice reached CLI compilation then timed out at300s. `target/local-linux-validation*.json` explicitly records false runtime acceptance; no Linux application test/install pass or source upload. Parent owns runner/cache follow-up.
+- Core RequestControl is a shared cooperative primitive only; renewed application/repository/transport work must observe it in real loops. Native/kernel-call force-stop and complete cancellation acceptance are not implied. Four renewed worker IDs/scopes are recorded in `docs/CREW_CURRENT_WAVE.md`.
 
 ## Last accepted development baseline
 

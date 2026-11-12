@@ -27,7 +27,7 @@ fn main() {
         })
         .collect();
     println!(
-        "diagnostic_only=true phase_isolation=true parser={} files={files} functions_per_file={functions} samples={samples} dataset_sha256={}",
+        "diagnostic_only=true phase_isolation=true parser={} files={files} functions_per_file={functions} samples={samples} dataset_blake3={}",
         kortex_core::PARSER_VERSION,
         hash(dataset)
     );
@@ -93,7 +93,7 @@ fn main() {
     drop(symbols);
     timings.sort_by(f64::total_cmp);
     println!(
-        "resolve_only_median_ms={:.3} p95_ms={:.3} edge_sha256={}",
+        "resolve_only_median_ms={:.3} p95_ms={:.3} edge_blake3={}",
         timings[samples / 2],
         timings[(samples as f64 * 0.95).ceil() as usize - 1],
         digest.unwrap()

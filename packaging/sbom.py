@@ -1,44 +1,63 @@
 #!/usr/bin/env python3
-"""Generate a local CycloneDX 1.5 inventory from Cargo's locked resolution.
+"""Generate a private CycloneDX 1.5 Cargo/frontend dependency superset.
 
-This records declared licenses; it is not a legal approval or vulnerability audit.
+Declared licenses are not legal approval, audit success or exact binary composition.
+No model downloads or source uploads occur. Cargo metadata resolution is offline.
 """
 import argparse
-import hashlib
 import json
-import pathlib
+import os
+from pathlib import Path
 import subprocess
-import urllib.parse
+import tempfile
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--output", default="target/kortex.cdx.json")
-args = parser.parse_args()
-metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"]))
-refs = {}
-components = []
-for package in metadata["packages"]:
-    name = package["name"]
-    version = package["version"]
-    purl = f"pkg:cargo/{urllib.parse.quote(name, safe='')}@{urllib.parse.quote(version, safe='')}"
-    refs[package["id"]] = purl
-    component = {"type": "library", "bom-ref": purl, "name": name, "version": version, "purl": purl}
-    if package.get("license"):
-        component["licenses"] = [{"expression": package["license"]}]
-    else:
-        component["properties"] = [{"name": "kortex:license-review", "value": "owner-pending"}]
-    components.append(component)
-dependencies = []
-for node in metadata["resolve"]["nodes"]:
-    dependencies.append({"ref": refs[node["id"]], "dependsOn": sorted({refs[d["pkg"]] for d in node["deps"]})})
-bom = {
-    "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
-    "metadata": {"tools": [{"vendor": "Kortex", "name": "locked-cargo-inventory", "version": "0.1.0"}],
-                 "properties": [{"name": "kortex:Cargo.lock:sha256", "value": hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest()},
-                                {"name": "kortex:release-approval", "value": "pending"}]},
-    "components": sorted(components, key=lambda c: c["bom-ref"]),
-    "dependencies": sorted(dependencies, key=lambda d: d["ref"]),
-}
-output = pathlib.Path(args.output)
-output.parent.mkdir(parents=True, exist_ok=True)
-output.write_text(json.dumps(bom, indent=2) + "\n")
-print(f"Wrote {len(components)} components to {output}; declarations require review.")
+from inventory import build_inventory
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", default="target/kortex.cdx.json")
+    args = parser.parse_args()
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--offline", "--all-features", "--format-version", "1"], cwd=ROOT
+    ))
+    license_path = ROOT / "LICENSE"
+    notice = license_path.read_text(encoding="utf-8")
+    members = set(metadata["workspace_members"])
+    for package in metadata["packages"]:
+        if package["id"] not in members:
+            continue
+        path = Path(package["license_file"] or "")
+        if not path.is_absolute():
+            path = Path(package["manifest_path"]).parent / path
+        if path.resolve() != license_path.resolve():
+            raise ValueError("first-party package does not use the owner's restrictive LICENSE")
+    frontend = None
+    manifest_path = ROOT / "web/package.json"
+    lock_path = ROOT / "web/package-lock.json"
+    if manifest_path.exists() or lock_path.exists():
+        raw_lock = lock_path.read_bytes()
+        frontend = (json.loads(manifest_path.read_bytes()), json.loads(raw_lock), raw_lock)
+    bom = build_inventory(metadata, (ROOT / "Cargo.lock").read_bytes(), notice, frontend)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(bom, stream, indent=2)
+            stream.write("\n")
+        os.replace(temporary, output)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print(f"Wrote {len(bom['components'])} locked Cargo/npm components to {output}; declaration inventory only.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

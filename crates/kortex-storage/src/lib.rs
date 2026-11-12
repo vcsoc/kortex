@@ -1,10 +1,29 @@
 //! SQLite generation store. Commit publishes all graph/FTS records atomically.
+/// Explicit scratch-only API. Not used by default Store, CLI or indexer.
+pub mod experimental;
 pub mod location;
 mod maintenance;
+mod publication;
+mod reads;
+pub use reads::{
+    FileDiagnosticPresence, FileInventoryEntry, MetadataSource, OrderedEdge, OrderedEdgePage,
+    ReadPage, ReadSession, SnapshotMetadata, SymbolFilter, SymbolInventoryEntry,
+};
+#[cfg(test)]
+#[path = "placement_tests.rs"]
+mod placement_integration_tests;
+#[cfg(test)]
+mod read_tests;
+#[cfg(test)]
+mod test_support;
+pub use publication::CommitTimings;
+#[cfg(test)]
+mod publication_tests;
 #[cfg(test)]
 mod recovery;
 pub mod registry;
 pub use maintenance::RepairReport;
+pub use registry::RepositorySelection;
 #[cfg(test)]
 mod boundary_tests;
 #[cfg(all(test, unix))]
@@ -51,6 +70,7 @@ impl Store {
         location::directory_for(root, storage)
     }
     pub fn open_with_storage(root: &Path, storage: &str, create: bool) -> Result<Self> {
+        kortex_repo::placement::require_derived_data_support()?;
         let directory = Self::directory_for(root, storage)?;
         if !create
             && directory
@@ -137,50 +157,8 @@ impl Store {
             None => Err(Error::new("INDEX_NOT_FOUND", "no committed generation", 3)),
         }
     }
-    pub fn commit(&mut self, snapshot: &Snapshot, _lock: &WriterLock) -> Result<()> {
-        if _lock.directory != self.directory {
-            return Err(Error::new(
-                "WRITER_LOCK_MISMATCH",
-                "writer lock belongs to another repository",
-                8,
-            ));
-        }
-        let raw = serde_json::to_string(snapshot)?;
-        let tx = self.conn.transaction().map_err(db_error)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO repositories(id,root,created_at) VALUES(?1,?2,datetime('now'))",
-            params![snapshot.repo_id, snapshot.root],
-        )
-        .map_err(db_error)?;
-        tx.execute("INSERT INTO generations(id,repo_id,status,git_head,config_hash,grammar_hash,started_at,snapshot) VALUES(?1,?2,'building',?3,?4,?5,datetime('now'),?6)", params![snapshot.generation_id,snapshot.repo_id,snapshot.git_head,snapshot.config_hash,snapshot.grammar_hash,raw]).map_err(db_error)?;
-        for file in &snapshot.files {
-            tx.execute("INSERT INTO files(id,generation_id,path,language,content_hash,size_bytes,facts_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![kortex_core::id(&[&snapshot.repo_id,&file.path]),snapshot.generation_id,file.path,file.language,file.content_hash,file.size_bytes as i64,serde_json::to_string(file)?]).map_err(db_error)?;
-            for s in &file.symbols {
-                tx.execute("INSERT INTO nodes(id,generation_id,repo_id,kind,name,qualified_name,file_path,start_line,end_line,data_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![s.symbol_id,snapshot.generation_id,s.repo_id,s.kind,s.name,s.qualified_name,s.file_path,s.span.start_line as i64,s.span.end_line as i64,serde_json::to_string(s)?]).map_err(db_error)?;
-                tx.execute("INSERT INTO symbol_fts(symbol_id,generation_id,name,qualified_name,file_path,text) VALUES(?1,?2,?3,?4,?5,?6)",params![s.symbol_id,snapshot.generation_id,s.name,s.qualified_name,s.file_path,format!("{} {} {}",s.signature,s.doc_comment.as_deref().unwrap_or(""),s.attributes["source_snippet"].as_str().unwrap_or(""))]).map_err(db_error)?;
-            }
-        }
-        for e in &snapshot.edges {
-            tx.execute("INSERT INTO edges(id,generation_id,repo_id,source_id,target_id,kind,resolution,confidence,data_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![e.id,snapshot.generation_id,e.repo_id,e.source_id,e.target_id,e.kind,e.resolution,e.confidence,serde_json::to_string(e)?]).map_err(db_error)?;
-        }
-        tx.execute(
-            "UPDATE generations SET status='committed',committed_at=datetime('now') WHERE id=?1",
-            [&snapshot.generation_id],
-        )
-        .map_err(db_error)?;
-        tx.execute("INSERT INTO index_state(repo_id,active_generation_id,index_format_version) VALUES(?1,?2,1) ON CONFLICT(repo_id) DO UPDATE SET active_generation_id=excluded.active_generation_id",params![snapshot.repo_id,snapshot.generation_id]).map_err(db_error)?;
-        // No reader loads piecemeal generations: query services hold immutable snapshots.
-        tx.execute(
-            "DELETE FROM symbol_fts WHERE generation_id<>?1",
-            [&snapshot.generation_id],
-        )
-        .map_err(db_error)?;
-        tx.execute(
-            "DELETE FROM generations WHERE id<>?1",
-            [&snapshot.generation_id],
-        )
-        .map_err(db_error)?;
-        tx.commit().map_err(db_error)
+    pub fn commit(&mut self, snapshot: &Snapshot, lock: &WriterLock) -> Result<()> {
+        self.commit_profiled(snapshot, lock).map(|_| ())
     }
     pub fn keyword(
         &self,
@@ -263,7 +241,10 @@ impl Store {
                 ));
             }
         }
-        let missing: i64 = self.conn.query_row("SELECT count(*) FROM nodes n WHERE n.generation_id=?1 AND NOT EXISTS(SELECT 1 FROM symbol_fts f WHERE f.generation_id=n.generation_id AND f.symbol_id=n.id)", [&snapshot.generation_id], |r| r.get(0)).map_err(db_error)?;
+        // FTS identity fields are UNINDEXED. A correlated NOT EXISTS scanned the
+        // entire FTS table for each node (quadratic at reference scale). Materialize
+        // the identity set once; NULLs cannot mask a missing identity with NOT IN.
+        let missing: i64 = self.conn.query_row("SELECT count(*) FROM nodes n WHERE n.generation_id=?1 AND (n.id IS NULL OR n.id NOT IN(SELECT symbol_id FROM symbol_fts WHERE generation_id=?1 AND symbol_id IS NOT NULL))", [&snapshot.generation_id], |r| r.get(0)).map_err(db_error)?;
         if missing != 0 {
             return Err(Error::new(
                 "CORRUPT_INDEX",

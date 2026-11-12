@@ -1,4 +1,6 @@
 //! Shared public domain model. Coordinates are 1-based UTF-8 byte columns.
+mod control;
+pub use control::RequestControl;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

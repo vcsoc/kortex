@@ -4,9 +4,9 @@ mod indexing;
 mod output;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use http::serve_http;
-use kortex_analysis::{Service, error_json};
+use kortex_analysis::{ReadService, Service, error_json, resolve_selection};
 use kortex_config::Config;
-use kortex_core::{Error, Result};
+use kortex_core::{Error, RequestControl, Result};
 use kortex_storage::{Store, registry::Registry};
 use serde_json::{Value, json};
 use std::{
@@ -355,7 +355,6 @@ fn run(cli: Cli) -> Result<()> {
             let events = kortex_repo::watch::Events::new(&root)?;
             let first =
                 kortex_indexer::index_at_root(&root, &config, &kortex_indexer::Options::default())?;
-            Registry::open()?.register(&first.snapshot)?;
             emit(
                 json!({"watching":root,"generation_id":first.snapshot.generation_id,"strategy":"native events with reconciliation","interval_ms":debounce_ms}),
                 output,
@@ -384,7 +383,6 @@ fn run(cli: Cli) -> Result<()> {
                         },
                     ) {
                         Ok(r) => {
-                            Registry::open()?.register(&r.snapshot)?;
                             emit(
                                 json!({"generation_id":r.snapshot.generation_id,"parsed":r.parsed,"reused":r.reused}),
                                 output,
@@ -432,16 +430,8 @@ fn run(cli: Cli) -> Result<()> {
                         ));
                     }
                     let root = Path::new(&row.1);
-                    let config = Config::load(root, cli.config.as_deref())?;
-                    let store = Store::open_with_storage(root, &config.index.storage, false)?;
-                    let snapshot = store.load()?;
-                    if snapshot.repo_id != repo_id {
-                        return Err(Error::new(
-                            "INDEX_OWNER",
-                            "index does not belong to registry entry",
-                            8,
-                        ));
-                    }
+                    let store =
+                        Service::open_registered(&repo_id, root, cli.config.as_deref())?.store;
                     let _lock = store.writer_lock()?;
                     let directory = store.directory.clone();
                     drop(store);
@@ -467,17 +457,13 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Config { command } => {
-            let root = if let Some(r) = cli.repo.as_deref() {
-                kortex_analysis::select_repo(Some(r))?
-            } else {
-                std::env::current_dir()?
-            };
-            let config = Config::load(&root, cli.config.as_deref())?;
+            let selector = cli.repo.as_deref().unwrap_or(".");
+            let (root, config) = resolve_selection(Some(selector), cli.config.as_deref())?;
             match command {
                 ConfigCommand::Show => emit(serde_json::to_value(config)?, output),
                 ConfigCommand::Validate => emit(json!({"valid":true}), output),
                 ConfigCommand::Path => emit(
-                    json!({"repository":cli.config.unwrap_or_else(||root.join(".kortex.toml")),"user":kortex_config::user_config_path(),"registry":Registry::path()?}),
+                    json!({"repository":config.origin.as_ref().map_or_else(|| root.join(".kortex.toml"), |origin| origin.explicit_config.clone().unwrap_or_else(|| origin.invocation_root.join(".kortex.toml"))),"user":kortex_config::user_config_path(),"registry":Registry::path()?}),
                     output,
                 ),
             }
@@ -506,16 +492,14 @@ fn run(cli: Cli) -> Result<()> {
             )?;
         }
         Command::Doctor { repair } => {
-            let base = kortex_analysis::select_repo(cli.repo.as_deref())?;
-            let c = Config::load(&base, cli.config.as_deref())?;
-            let root = c.resolved_root(&base)?;
+            let (root, c) = resolve_selection(cli.repo.as_deref(), cli.config.as_deref())?;
             let mut preservation = None;
             if repair {
                 let report = Store::repair(&root, &c.index.storage)?;
                 preservation = Some(
                     json!({"backup_directory":report.backup_directory,"preserved_files":report.preserved_files}),
                 );
-                let r = kortex_indexer::index_at_root(
+                kortex_indexer::index_at_root(
                     &root,
                     &c,
                     &kortex_indexer::Options {
@@ -524,7 +508,6 @@ fn run(cli: Cli) -> Result<()> {
                         dry_run: false,
                     },
                 )?;
-                Registry::open()?.register(&r.snapshot)?;
             }
             let service = Service::open_at_root(&root, c)?;
             let mut status = service.execute("status", &json!({}))?;
@@ -661,13 +644,24 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(nodes) = cli.max_nodes {
                 args["max_nodes"] = json!(nodes);
             }
-            let root = if let Some(path) = path {
-                kortex_repo::root(&path)?
-            } else {
-                kortex_analysis::select_repo(cli.repo.as_deref())?
-            };
-            let service = Service::open_with_config(&root, cli.config.as_deref())?;
-            let result = service.execute(op, &args)?;
+            let control = RequestControl::new(std::time::Duration::from_millis(
+                cli.timeout_ms.unwrap_or(60_000),
+            ))?;
+            let signal = control.clone();
+            ctrlc::set_handler(move || signal.cancel())
+                .map_err(|e| Error::new("SIGNAL_ERROR", e.to_string(), 1))?;
+            control.check()?;
+            let selector = path
+                .as_ref()
+                .map(|path| {
+                    path.to_str().ok_or_else(|| {
+                        Error::new("PATH_REFUSED", "repository path must be UTF-8", 8)
+                    })
+                })
+                .transpose()?
+                .or(cli.repo.as_deref());
+            let service = ReadService::open_selected(selector, cli.config.as_deref())?;
+            let result = service.execute_with_control(op, &args, &control)?;
             let check_exit = if op == "check" {
                 result["data"]["exit_code"].as_i64().unwrap_or(7) as i32
             } else {

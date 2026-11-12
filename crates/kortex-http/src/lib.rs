@@ -15,8 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use kortex_analysis::Service;
-use kortex_core::{Error, Result, hash};
+use kortex_analysis::ReadService;
+use kortex_core::{Error, RequestControl, Result, hash};
 use kortex_storage::registry::Registry;
 use serde_json::{Value, json};
 use std::{
@@ -25,12 +25,12 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 const MAX_BODY: usize = 16 * 1024;
 const MAX_QUERY: usize = 8192;
@@ -149,12 +149,32 @@ struct App {
     config: Config,
     slots: Arc<Semaphore>,
     assets: Option<Arc<assets::Assets>>,
+    shutdown: Shutdown,
+}
+
+/// Cooperative stop signal for embedded servers. Blocking workers retain their permits
+/// until they finish; this does not forcibly interrupt kernel I/O or native operators.
+#[derive(Clone)]
+pub struct Shutdown(watch::Sender<bool>);
+impl Shutdown {
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+    async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver.wait_for(|stopped| *stopped).await;
+    }
 }
 #[derive(Clone)]
 struct Admission(Arc<OwnedSemaphorePermit>);
 
 /// Builds actual production handlers, also used by executable contract tests.
 pub fn app(config: Config) -> Result<Router> {
+    app_with_shutdown(config).map(|(router, _)| router)
+}
+
+/// Build the same production router with an explicit cooperative shutdown handle.
+pub fn app_with_shutdown(config: Config) -> Result<(Router, Shutdown)> {
     config.validate()?;
     let assets = config
         .web_assets
@@ -162,19 +182,24 @@ pub fn app(config: Config) -> Result<Router> {
         .map(assets::Assets::load)
         .transpose()?
         .map(Arc::new);
+    let shutdown = Shutdown(watch::channel(false).0);
     let state = App {
         slots: Arc::new(Semaphore::new(config.concurrency)),
         assets,
         config,
+        shutdown: shutdown.clone(),
     };
     let mut router = Router::new();
     for (path, _) in contract::ROUTES {
         router = router.route(&format!("/api/v1{path}"), any(dispatch));
     }
-    Ok(router
-        .fallback(fallback)
-        .layer(middleware::from_fn_with_state(state.clone(), guard))
-        .with_state(state))
+    Ok((
+        router
+            .fallback(fallback)
+            .layer(middleware::from_fn_with_state(state.clone(), guard))
+            .with_state(state),
+        shutdown,
+    ))
 }
 
 /// Explicit caller opt-in only. This function never makes outbound connections.
@@ -186,7 +211,7 @@ pub fn serve(config: Config) -> Result<()> {
             "Warning: binding Kortex HTTP beyond loopback; bearer authentication and repository policy are enforced."
         );
     }
-    let router = app(config)?;
+    let (router, shutdown) = app_with_shutdown(config)?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -197,8 +222,9 @@ pub fn serve(config: Config) -> Result<()> {
                 listener::BoundedListener::new(listener, 64, Duration::from_secs(30)),
                 router,
             )
-            .with_graceful_shutdown(async {
+            .with_graceful_shutdown(async move {
                 let _ = tokio::signal::ctrl_c().await;
+                shutdown.cancel();
             })
             .await
         })?;
@@ -393,9 +419,19 @@ async fn guard(State(state): State<App>, mut request: Request, next: Next) -> Re
                 }
             },
         };
-        match tokio::time::timeout(deadline, next.run(request)).await {
-            Ok(response) => response,
-            Err(_) => error_response(Error::new("TIMEOUT", "request deadline exceeded", 9), &id),
+        let control = match RequestControl::new(deadline) {
+            Ok(control) => control,
+            Err(error) => return error_response(error, &id),
+        };
+        let _cancel_on_drop = CancelOnDrop(control.clone());
+        request.extensions_mut().insert(control.clone());
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => error_response(Error::new("CANCELLED", "server shutting down", 9), &id),
+            result = tokio::time::timeout_at(control.deadline().into(), next.run(request)) => match result {
+                Ok(response) => response,
+                Err(_) => error_response(Error::new("TIMEOUT", "request deadline exceeded", 9), &id),
+            }
         }
     }
     .await;
@@ -464,10 +500,10 @@ async fn fallback(State(state): State<App>, request: Request) -> Response {
         dispatch(State(state), request).await
     }
 }
-struct CancelOnDrop(Arc<AtomicBool>);
+struct CancelOnDrop(RequestControl);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancel();
     }
 }
 
@@ -598,15 +634,22 @@ async fn dispatch_inner(state: &App, request: &mut Request, id: &str) -> Result<
         .remove::<Admission>()
         .ok_or_else(|| Error::new("INTERNAL", "missing admission", 1))?;
     let policy = state.config.clone();
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let mut control = request
+        .extensions()
+        .get::<RequestControl>()
+        .cloned()
+        .ok_or_else(|| Error::new("INTERNAL", "missing request control", 1))?;
+    if let Some(timeout) = args["timeout_ms"].as_u64() {
+        control =
+            control.restrict_deadline(std::time::Instant::now() + Duration::from_millis(timeout));
+    }
+    let deadline = control.deadline();
     let id = id.to_owned();
-    tokio::task::spawn_blocking(move || {
+    let worker = tokio::task::spawn_blocking(move || {
         let _permit = admission.0; // A timed-out/disconnected worker retains its slot until it actually finishes.
-        if cancelled.load(Ordering::Acquire) {
-            return Err(Error::new("CANCELLED", "request cancelled", 9));
-        }
+        control.check()?;
         let registry = Registry::open()?.list()?;
+        control.check()?;
         if operation == "repos" {
             return repos_page(registry, &policy, &args, &id);
         }
@@ -621,29 +664,25 @@ async fn dispatch_inner(state: &App, request: &mut Request, id: &str) -> Result<
                     3,
                 )
             })?;
-        // Registry roots are already effective repository identities. Never let a repository
-        // config redirect an authorized remote request to another filesystem root.
-        let config = kortex_config::Config::load(Path::new(root), None)?;
-        let service = Service::open_at_root(Path::new(root), config)?;
-        if service.snapshot.repo_id != repo {
+        // Preserve stored invocation/config provenance while pinning this authorized ID
+        // to the exact registered root. Shared policy rejects configuration redirection.
+        let reader = ReadService::open_registered(&repo, Path::new(root), None)?;
+        if reader.metadata().repo_id != repo {
             return Err(Error::new(
                 "REPO_FORBIDDEN",
                 "registry/index identity mismatch",
                 8,
             ));
         }
-        if cancelled.load(Ordering::Acquire) {
-            return Err(Error::new("CANCELLED", "request cancelled", 9));
-        }
-        let mut result = service.execute(operation, &args)?;
-        if cancelled.load(Ordering::Acquire) {
-            return Err(Error::new("CANCELLED", "request cancelled", 9));
-        }
+        let mut result = reader.execute_with_control(operation, &args, &control)?;
+        control.check()?;
         result["request_id"] = json!(id);
         Ok(result)
-    })
-    .await
-    .map_err(|_| Error::new("INTERNAL", "HTTP worker failed", 1))?
+    });
+    tokio::time::timeout_at(deadline.into(), worker)
+        .await
+        .map_err(|_| Error::new("TIMEOUT", "request deadline exceeded", 9))?
+        .map_err(|_| Error::new("INTERNAL", "HTTP worker failed", 1))?
 }
 
 async fn parse_arguments(request: &mut Request, operation: &str) -> Result<Value> {

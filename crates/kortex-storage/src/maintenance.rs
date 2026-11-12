@@ -220,6 +220,7 @@ impl Store {
     /// Caller must close all Store handles first, then reindex; failure leaves this backup intact.
     /// The writer lock, source files, .kortex.toml and unknown files are never moved/deleted.
     pub fn repair(root: &Path, storage: &str) -> Result<RepairReport> {
+        kortex_repo::placement::require_derived_data_support()?;
         let directory = Self::directory_for(root, storage)?;
         location::check_index_directory(&directory, storage, false)?;
         let _lock = acquire_writer(&directory)?;

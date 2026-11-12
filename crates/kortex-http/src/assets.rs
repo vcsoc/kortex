@@ -32,6 +32,15 @@ fn mime(path: &str) -> Option<&'static str> {
         "json" => Some("application/json; charset=utf-8"),
         "svg" => Some("image/svg+xml"),
         "txt" => Some("text/plain; charset=utf-8"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "ico" => Some("image/vnd.microsoft.icon"),
+        "woff" => Some("font/woff"),
+        "woff2" => Some("font/woff2"),
+        "ttf" => Some("font/ttf"),
+        "otf" => Some("font/otf"),
         _ => None,
     }
 }
@@ -115,7 +124,16 @@ impl Assets {
                     ));
                 }
                 let Some(mime) = mime(&public) else { continue }; // Never serve source maps, directory contents or arbitrary file types.
-                let bytes = kortex_repo::read_confined(&root, &public, MAX_FILE)?.into_bytes();
+                let bytes = if mime.starts_with("text/")
+                    || matches!(mime, "application/json; charset=utf-8" | "image/svg+xml")
+                {
+                    // Keep text validation (including NUL/invalid UTF-8 refusal) unchanged.
+                    kortex_repo::read_confined(&root, &public, MAX_FILE)?.into_bytes()
+                } else {
+                    // Binary assets use the shared descriptor-relative reader, never an
+                    // ambient std::fs::read fallback. Bytes are opaque, not decoded/executed.
+                    kortex_repo::read_confined_bytes(&root, &public, MAX_FILE)?
+                };
                 total += bytes.len();
                 if total > MAX_TOTAL {
                     return Err(Error::new(

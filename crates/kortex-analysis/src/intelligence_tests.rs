@@ -5,6 +5,8 @@ use tempfile::TempDir;
 mod extra;
 #[path = "inventory_tests.rs"]
 mod inventory;
+#[path = "request_control_tests.rs"]
+mod request_control_tests;
 #[path = "schema_tests.rs"]
 mod schema;
 fn indexed(files: &[(&str, &str)]) -> (TempDir, Service) {

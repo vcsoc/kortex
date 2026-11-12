@@ -12,6 +12,11 @@ let server: ChildProcess;
 let apiOrigin: string;
 let ids: string[] = [];
 const token = "browser-test-only-bearer-token-32-bytes";
+const hostileLabel =
+  '"</text><script>window.__injected=1</script>&svg_hostile\u0001🔒"';
+let selectedConfig: string;
+let selectedIndex: number;
+let largeIndex: number;
 const binary =
   process.env.KORTEX_TEST_BINARY ??
   resolve("../target/transport-http/debug/kortex");
@@ -69,6 +74,11 @@ test.beforeAll(async () => {
       join(root, "app.py"),
       `from fastapi import FastAPI\napp = FastAPI()\n\ndef leaf_${name}():\n    return True\n\n@app.get('/${name}')\ndef entry_${name}():\n    \"\"\"<img src=x onerror=window.__injected=1>\"\"\"\n    return leaf_${name}()\n`,
     );
+    if (name === "first")
+      await writeFile(
+        join(root, "labels<&.ts"),
+        `class Hostile { ${hostileLabel}() { return 1; } }\n`,
+      );
     const deep = join(root, ...Array<string>(65).fill("d"));
     await mkdir(deep, { recursive: true });
     await writeFile(join(deep, "deep.py"), "def deep_evidence():\n    pass\n");
@@ -76,6 +86,37 @@ test.beforeAll(async () => {
     fixtureGit(root, ["commit", "--quiet", "-m", "local browser fixture"]);
     ids.push(cli(root, ["index", "."]).repo_id);
   }
+  // Explicit relocated selection must survive ID-only access from the server's unrelated cwd.
+  const selected = join(directory, "provenance");
+  await mkdir(join(selected, "src"), { recursive: true });
+  await writeFile(
+    join(selected, "src", "selected.py"),
+    "def provenance_entry():\n    pass\n",
+  );
+  selectedConfig = join(selected, "chosen.toml");
+  await writeFile(selectedConfig, "[repository]\nroot='src'\n");
+  selectedIndex = ids.length;
+  ids.push(cli(selected, ["--config", "chosen.toml", "index", "."]).repo_id);
+  const large = join(directory, "large");
+  await mkdir(large);
+  const branches = Array.from({ length: 20 }, (_, i) => `b${i}`);
+  const source =
+    "def large_hub():\n" +
+    branches.map((name) => `    ${name}()\n`).join("") +
+    branches
+      .map(
+        (name, i) =>
+          `\ndef ${name}():\n` +
+          Array.from({ length: 15 }, (_, j) => `    f${i}_${j}()\n`).join("") +
+          Array.from(
+            { length: 15 },
+            (_, j) => `\ndef f${i}_${j}():\n    pass\n`,
+          ).join(""),
+      )
+      .join("");
+  await writeFile(join(large, "large.py"), source);
+  largeIndex = ids.length;
+  ids.push(cli(large, ["index", "."]).repo_id);
   const reservation = net.createServer();
   await new Promise<void>((resolve) =>
     reservation.listen(0, "127.0.0.1", resolve),
@@ -357,4 +398,285 @@ test("repository isolation, keyboard navigation, responsive themes and denial", 
     .fill("incorrect-token-that-still-has-32-bytes");
   await page.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("AUTH_REQUIRED");
+});
+
+test("registered selection provenance and config tamper fail closed through real API", async ({
+  page,
+}) => {
+  await connect(page);
+  await page
+    .getByLabel("Repository", { exact: true })
+    .selectOption(ids[selectedIndex]);
+  await expect(page.getByRole("status")).toContainText("loaded");
+  await page
+    .getByLabel("Search indexed code", { exact: true })
+    .fill("provenance_entry");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Search results" }),
+  ).toContainText("provenance_entry");
+  const original = await readFile(selectedConfig, "utf8");
+  try {
+    // The destination is a different real indexed repository, not a nonexistent path.
+    await writeFile(selectedConfig, "[repository]\nroot='../second'\n");
+    const response = await page.request.get(
+      `${apiOrigin}/api/v1/repos/${ids[selectedIndex]}/status`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
+    expect(response.status()).toBe(403);
+    const error = await response.json();
+    expect(error.error.code).toBe("REPO_FORBIDDEN");
+    expect(JSON.stringify(error)).not.toContain("entry_second");
+    expect(response.headers()["x-request-id"]).toBe(error.request_id);
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(page.getByRole("alert")).toContainText("REPO_FORBIDDEN");
+  } finally {
+    await writeFile(selectedConfig, original);
+  }
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Search results" }),
+  ).toContainText("provenance_entry");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("actual hostile symbol names remain inert XML text in exported SVG", async ({
+  page,
+}) => {
+  await connect(page);
+  await page
+    .getByLabel("Search indexed code", { exact: true })
+    .fill("svg_hostile");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await page
+    .getByRole("region", { name: "Search results" })
+    .getByRole("button")
+    .filter({ hasText: "svg_hostile" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Symbol details" }),
+  ).toContainText("labels<&.ts");
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export SVG", exact: true }).click();
+  const path = await (await downloadPromise).path();
+  const svg = await readFile(path!, "utf8");
+  const parsed = await page.evaluate((text) => {
+    const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+    return {
+      errors: doc.getElementsByTagName("parsererror").length,
+      scripts: doc.getElementsByTagName("script").length,
+      foreign: doc.getElementsByTagName("foreignObject").length,
+      events: Array.from(doc.querySelectorAll("*")).flatMap((n) =>
+        n.getAttributeNames().filter((a) => a.startsWith("on")),
+      ),
+      labels: Array.from(
+        doc.getElementsByTagName("text"),
+        (n) => n.textContent,
+      ),
+      titles: Array.from(
+        doc.getElementsByTagName("title"),
+        (n) => n.textContent,
+      ).join("\n"),
+    };
+  }, svg);
+  expect(parsed.errors).toBe(0);
+  expect(parsed.scripts).toBe(0);
+  expect(parsed.foreign).toBe(0);
+  expect(parsed.events).toEqual([]);
+  expect(parsed.labels).toContain(
+    hostileLabel.slice(0, 64).replace("\u0001", "\uFFFD"),
+  );
+  expect(parsed.titles).toContain("labels<&.ts");
+  expect(parsed.titles).toContain("\uFFFD🔒");
+  expect(
+    await page.evaluate(() =>
+      Object.prototype.hasOwnProperty.call(window, "__injected"),
+    ),
+  ).toBe(false);
+  expect(
+    (
+      await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+        .analyze()
+    ).violations,
+  ).toEqual([]);
+});
+
+test("large indexed graph is bounded, explicitly truncated, exportable and keyboard navigable", async ({
+  page,
+}) => {
+  await connect(page);
+  await page
+    .getByLabel("Repository", { exact: true })
+    .selectOption(ids[largeIndex]);
+  await page.getByLabel("Maximum traversal nodes", { exact: true }).fill("60");
+  await page
+    .getByLabel("Search indexed code", { exact: true })
+    .fill("large_hub");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await page.getByRole("button", { name: "large_hub", exact: true }).click();
+  await expect(
+    page.getByRole("img", { name: /Dependency graph with/ }),
+  ).toBeVisible();
+  await expect(page.getByText(/Traversal truncated/)).toBeVisible();
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export JSON", exact: true }).click();
+  const path = await (await downloadPromise).path();
+  const graph = JSON.parse(await readFile(path!, "utf8"));
+  expect(graph.repo_id).toBe(ids[largeIndex]);
+  expect(graph.truncated).toBe(true);
+  expect(graph.data.nodes.length).toBeLessThanOrEqual(60);
+  expect(graph.data.nodes.length).toBeGreaterThan(20);
+  const included = new Set(
+    graph.data.nodes.map((n: { symbol_id: string }) => n.symbol_id),
+  );
+  for (const edge of graph.data.edges) {
+    expect(included.has(edge.source_id)).toBe(true);
+    if (edge.target_id) expect(included.has(edge.target_id)).toBe(true);
+  }
+  await page.getByText("Keyboard graph navigation", { exact: true }).click();
+  await expect(page.locator(".node-list button")).toHaveCount(
+    graph.data.nodes.length,
+  );
+  await page.locator(".node-list button").first().focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("status")).toContainText(
+    "Symbol details and bounded graph loaded",
+  );
+  expect(
+    (
+      await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+        .analyze()
+    ).violations,
+  ).toEqual([]);
+});
+
+test("real API rejects missing auth and browser abort recovers without retained credentials", async ({
+  page,
+}) => {
+  await connect(page);
+  const unauthorized = await page.request.get(
+    `${apiOrigin}/api/v1/repos/${ids[0]}/status`,
+  );
+  expect(unauthorized.status()).toBe(401);
+  expect((await unauthorized.json()).error.code).toBe("AUTH_REQUIRED");
+  // Actual browser fetch/AbortSignal, no Playwright routing or response mocks. This
+  // proves client cancellation, not forcible interruption of synchronous Rust work.
+  const cancelled = await page.evaluate(
+    async ({ origin, id, credential }) => {
+      const controller = new AbortController();
+      const request = fetch(`${origin}/api/v1/repos/${id}/query?text=entry`, {
+        headers: { Authorization: `Bearer ${credential}` },
+        signal: controller.signal,
+      });
+      controller.abort();
+      try {
+        await request;
+        return "unexpected success";
+      } catch (error) {
+        return error instanceof DOMException ? error.name : "other";
+      }
+    },
+    { origin: apiOrigin, id: ids[0], credential: token },
+  );
+  expect(cancelled).toBe("AbortError");
+  await selectEntry(page);
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  expect(
+    await page.getByRole("region", { name: "Symbol details" }).count(),
+  ).toBe(0);
+  expect(
+    await page.getByLabel("Bearer token", { exact: true }).inputValue(),
+  ).toBe("");
+  await connect(page);
+  await selectEntry(page);
+});
+
+test("real architecture violation evidence exports and invalid rule paths are refused", async ({
+  page,
+}) => {
+  await connect(page);
+  await page.getByRole("tab", { name: "Rules", exact: true }).click();
+  await page.getByLabel("Rules JSON", { exact: true }).fill(
+    JSON.stringify({
+      rules_version: "1.0",
+      rules: [
+        {
+          id: "no-app-call",
+          kind: "forbid_dependency",
+          from: { path: "app.py", kinds: ["function"] },
+          to: { path: "app.py", kinds: ["function"] },
+          edge_kinds: ["CALLS"],
+          max_depth: 1,
+        },
+      ],
+    }),
+  );
+  await page
+    .getByRole("button", { name: "Evaluate architecture rules", exact: true })
+    .click();
+  await expect(page.getByRole("tabpanel")).toContainText('"exit_code": 10');
+  const downloadPromise = page.waitForEvent("download");
+  await page
+    .getByRole("button", {
+      name: "Export architecture report JSON",
+      exact: true,
+    })
+    .click();
+  const path = await (await downloadPromise).path();
+  const report = JSON.parse(await readFile(path!, "utf8"));
+  expect(report.repo_id).toBe(ids[0]);
+  expect(report.data.exit_code).toBe(10);
+  expect(report.data.violations.length).toBeGreaterThan(0);
+  expect(report.data.violations[0].edges[0].kind).toBe("CALLS");
+  expect(
+    report.data.violations[0].edges[0].source_span.start_line,
+  ).toBeGreaterThan(0);
+  await page
+    .getByLabel("Rules JSON", { exact: true })
+    .fill('{"rules_file":"/etc/passwd"}');
+  await page
+    .getByRole("button", { name: "Evaluate architecture rules", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toContainText("INVALID_INPUT");
+  await expect(page.getByRole("alert")).not.toContainText("root:x:");
+});
+
+test("generation pin rejects changed index until explicit browser reload", async ({
+  page,
+}) => {
+  await connect(page);
+  await page.getByLabel("Repository", { exact: true }).selectOption(ids[1]);
+  await selectEntry(page, "second");
+  const root = join(directory, "second");
+  const source = join(root, "app.py");
+  const original = await readFile(source, "utf8");
+  try {
+    await writeFile(source, original + "\ndef generation_added():\n    pass\n");
+    cli(root, ["index", "."]);
+    await page
+      .getByLabel("Search indexed code", { exact: true })
+      .fill("generation_added");
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(page.getByRole("alert")).toContainText("GENERATION_MISMATCH");
+    await expect(
+      page.getByRole("region", { name: "Search results" }),
+    ).not.toContainText("generation_added");
+    await page.getByRole("tab", { name: "Status", exact: true }).click();
+    await page
+      .getByRole("button", { name: "Reload indexed generation", exact: true })
+      .click();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await page.getByRole("tab", { name: "Explore", exact: true }).click();
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(
+      page.getByRole("region", { name: "Search results" }),
+    ).toContainText("generation_added");
+  } finally {
+    await writeFile(source, original);
+    cli(root, ["index", "."]);
+  }
 });

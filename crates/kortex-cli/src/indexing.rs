@@ -2,7 +2,6 @@
 use crate::IndexArgs;
 use kortex_config::Config;
 use kortex_core::Result;
-use kortex_storage::registry::Registry;
 use serde_json::{Value, json};
 use std::path::Path;
 fn one(path: &Path, args: &IndexArgs, config_path: Option<&Path>) -> Result<Value> {
@@ -39,9 +38,6 @@ fn one(path: &Path, args: &IndexArgs, config_path: Option<&Path>) -> Result<Valu
             verify: args.verify,
         },
     )?;
-    if r.committed {
-        Registry::open()?.register(&r.snapshot)?;
-    }
     let diagnostics = r.snapshot.diagnostics.len()
         + r.snapshot
             .files

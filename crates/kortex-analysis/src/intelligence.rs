@@ -1,12 +1,9 @@
 //! Conservative framework adapters. Syntax trees + verified indexed source, never names alone.
 use crate::{Service, boolean, number};
-use kortex_core::{Error, ParsedFile, Result, Symbol, hash, id};
+use kortex_core::{Error, ParsedFile, RequestControl, Result, Symbol, hash, id};
 use kortex_graph::{Direction, Limits};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, ParseOptions, Parser};
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -34,17 +31,11 @@ fn children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut c = node.walk();
     node.named_children(&mut c).collect()
 }
-fn nodes(root: Node<'_>, deadline: Instant) -> Result<Vec<Node<'_>>> {
+fn nodes<'a>(root: Node<'a>, control: &RequestControl) -> Result<Vec<Node<'a>>> {
     let mut stack = vec![(root, 0)];
     let mut out = vec![];
     while let Some((n, depth)) = stack.pop() {
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "route AST deadline exceeded",
-                9,
-            ));
-        }
+        control.check()?;
         if depth > 256 || out.len() >= 200_000 {
             return Err(Error::new("QUERY_LIMIT", "route AST bounds exceeded", 7));
         }
@@ -68,6 +59,7 @@ fn method(value: &str) -> Option<&'static str> {
 struct Adapter<'a> {
     file: &'a ParsedFile,
     source: &'a str,
+    control: &'a RequestControl,
     factories: BTreeMap<String, String>,
     factory_positions: BTreeMap<String, usize>,
     apps: BTreeMap<String, String>,
@@ -78,8 +70,9 @@ impl Adapter<'_> {
     fn bind(&mut self, name: &str) {
         *self.bindings.entry(name.into()).or_default() += 1;
     }
-    fn imports(&mut self, root: Node<'_>) {
+    fn imports(&mut self, root: Node<'_>) -> Result<()> {
         for n in children(root) {
+            self.control.check()?;
             if n.kind() == "import_from_statement" {
                 let Some(module) = n.child_by_field_name("module_name") else {
                     continue;
@@ -153,9 +146,11 @@ impl Adapter<'_> {
                 }
             }
         }
+        Ok(())
     }
-    fn collect_bindings(&mut self, all: &[Node<'_>]) {
+    fn collect_bindings(&mut self, all: &[Node<'_>]) -> Result<()> {
         for n in all {
+            self.control.check()?;
             if n.kind() == "delete_statement" {
                 for name in children(*n)
                     .into_iter()
@@ -232,8 +227,9 @@ impl Adapter<'_> {
                 self.bind(text(name, self.source));
             }
         }
+        Ok(())
     }
-    fn applications(&mut self, root: Node<'_>) {
+    fn applications(&mut self, root: Node<'_>) -> Result<()> {
         // Only module-level assignments prove the receiver binding; nested construction is unsupported.
         let statements = children(root)
             .into_iter()
@@ -251,6 +247,7 @@ impl Adapter<'_> {
         // Explicit CommonJS factory; require must itself be unshadowed.
         if self.bindings.get("require").copied().unwrap_or(0) == 0 {
             for n in &statements {
+                self.control.check()?;
                 if n.kind() != "variable_declarator" {
                     continue;
                 }
@@ -285,6 +282,7 @@ impl Adapter<'_> {
             }
         }
         for n in statements {
+            self.control.check()?;
             if !matches!(n.kind(), "assignment" | "variable_declarator") {
                 continue;
             }
@@ -327,6 +325,7 @@ impl Adapter<'_> {
                     .insert(text(name, self.source).into(), n.start_byte());
             }
         }
+        Ok(())
     }
 }
 fn location(file: &ParsedFile, node: Node<'_>) -> Value {
@@ -346,6 +345,7 @@ fn route(
     registration: Registration<'_>,
     processes: bool,
     limits: &Limits,
+    control: &RequestControl,
 ) -> Result<Value> {
     let Registration {
         framework,
@@ -360,30 +360,28 @@ fn route(
         http_method,
         path,
     ]);
-    let consumers=service.snapshot.edges.iter().filter(|e| e.kind=="CALLS" && e.target_id.as_deref()==Some(&handler.symbol_id) && matches!(e.resolution.as_str(),"exact"|"inferred")).take(501).map(|e|json!({"symbol_id":e.source_id,"edge_id":e.id,"kind":"direct_handler_call","resolution":e.resolution,"confidence":e.confidence,"evidence":e.evidence,"source_span":e.source_span})).collect::<Vec<_>>();
-    let upstream = kortex_graph::traverse_kinds(
+    let consumers=service.matching_edges(control, |e| e.kind=="CALLS" && e.target_id.as_deref()==Some(&handler.symbol_id) && matches!(e.resolution.as_str(),"exact"|"inferred"))?.into_iter().map(|e|json!({"symbol_id":e.source_id,"edge_id":e.id,"kind":"direct_handler_call","resolution":e.resolution,"confidence":e.confidence,"evidence":e.evidence,"source_span":e.source_span})).collect::<Vec<_>>();
+    let upstream = kortex_graph::traverse_kinds_with_control(
         &service.snapshot,
         &handler.symbol_id,
         Direction::Upstream,
         limits,
         &["CALLS", "TESTS"],
+        control,
     )?;
     // Test identities require explicit framework AST or persisted TESTS evidence.
-    let tests = crate::test_map::associations(
-        service,
-        &upstream.items,
-        Instant::now() + std::time::Duration::from_millis(limits.timeout_ms),
-    )?;
+    let tests = crate::test_map::associations(service, &upstream.items, control)?;
     let provenance = json!({"adapter_version":"framework-ast-1","source_hash":file.content_hash,"generation_id":service.snapshot.generation_id,"location":location(file,node),"basis":"verified framework import + constructor binding + literal registration + indexed declaration"});
     let mut bounded = upstream.truncated || consumers.len() > 500;
     let mut partial = upstream.ambiguous_relationships > 0 || upstream.unresolved_relationships > 0;
     let process = if processes {
-        let downstream = kortex_graph::traverse_kinds(
+        let downstream = kortex_graph::traverse_kinds_with_control(
             &service.snapshot,
             &handler.symbol_id,
             Direction::Downstream,
             limits,
             &["CALLS"],
+            control,
         )?;
         bounded |= downstream.truncated;
         partial |=
@@ -396,7 +394,7 @@ fn route(
         json!({"route_id":route_id,"framework":framework,"http_method":http_method,"path":path,"handler_id":handler.symbol_id,"location":location(file,node),"resolution":"exact","confidence":1.0,"provenance":provenance,"consumers":consumers.into_iter().take(500).collect::<Vec<_>>(),"tests":tests,"process":process,"partial":partial,"truncated":bounded}),
     )
 }
-pub fn discover(service: &Service, args: &Value, deadline: Instant) -> Result<Value> {
+pub fn discover(service: &Service, args: &Value, control: &RequestControl) -> Result<Value> {
     let processes = boolean(args, "include_processes", true)?;
     let limits = service.limits(args)?;
     let framework = args
@@ -423,24 +421,21 @@ pub fn discover(service: &Service, args: &Value, deadline: Instant) -> Result<Va
         ) {
             continue;
         }
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "QUERY_TIMEOUT",
-                "route discovery deadline exceeded",
-                9,
-            ));
-        }
-        let source = match kortex_repo::read_confined(
+        control.check()?;
+        let source = match kortex_repo::read_confined_with_control(
             &service.root,
             &file.path,
             service.config.repository.max_file_size_bytes,
+            control,
         ) {
             Ok(s) if hash(&s) == file.content_hash => s,
+            Err(error) if error.exit == 9 => return Err(error),
             _ => {
                 diagnostics.push(json!({"path":file.path,"message":"indexed source unavailable or changed; route evidence refused"}));
                 continue;
             }
         };
+        control.check()?;
         let grammar = match file.language.as_str() {
             "python" => tree_sitter_python::LANGUAGE.into(),
             "typescript" if file.path.ends_with(".tsx") => {
@@ -454,20 +449,26 @@ pub fn discover(service: &Service, args: &Value, deadline: Instant) -> Result<Va
             .set_language(&grammar)
             .map_err(|e| Error::new("GRAMMAR_ERROR", e.to_string(), 7))?;
         let bytes = source.as_bytes();
-        let mut cancel = |_: &tree_sitter::ParseState| Instant::now() >= deadline;
+        let mut cancel = |_: &tree_sitter::ParseState| control.check().is_err();
         let tree = parser
             .parse_with_options(
                 &mut |offset, _| &bytes[offset..],
                 None,
                 Some(ParseOptions::new().progress_callback(&mut cancel)),
             )
-            .ok_or_else(|| Error::new("QUERY_TIMEOUT", "route parse deadline exceeded", 9))?;
+            .ok_or_else(|| {
+                control
+                    .check()
+                    .err()
+                    .unwrap_or_else(|| Error::new("PARSE_FAILED", "route parser aborted", 7))
+            })?;
+        control.check()?;
         if tree.root_node().has_error() {
             diagnostics
                 .push(json!({"path":file.path,"message":"syntax errors; framework facts refused"}));
             continue;
         }
-        let all = nodes(tree.root_node(), deadline)?;
+        let all = nodes(tree.root_node(), control)?;
         if file.imports.iter().any(|i| {
             matches!(
                 (i.module.as_str(), i.imported.as_str()),
@@ -479,13 +480,14 @@ pub fn discover(service: &Service, args: &Value, deadline: Instant) -> Result<Va
         let mut adapter = Adapter {
             file,
             source: &source,
+            control,
             factories: BTreeMap::new(),
             factory_positions: BTreeMap::new(),
             apps: BTreeMap::new(),
             app_positions: BTreeMap::new(),
             bindings: BTreeMap::new(),
         };
-        adapter.imports(tree.root_node());
+        adapter.imports(tree.root_node())?;
         adapter.factories.retain(|_, framework| {
             let directory = file
                 .path
@@ -504,10 +506,11 @@ pub fn discover(service: &Service, args: &Value, deadline: Instant) -> Result<Va
                 .iter()
                 .any(|f| local.contains(&f.path))
         });
-        adapter.collect_bindings(&all);
-        adapter.applications(tree.root_node());
+        adapter.collect_bindings(&all)?;
+        adapter.applications(tree.root_node())?;
         let mut seen = BTreeSet::new();
         for n in &all {
+            control.check()?;
             if !matches!(n.kind(), "call" | "call_expression") {
                 continue;
             }
@@ -705,18 +708,23 @@ pub fn discover(service: &Service, args: &Value, deadline: Instant) -> Result<Va
                         },
                         processes,
                         &limits,
+                        control,
                     )?);
                 }
             }
         }
     }
-    items.sort_by(|a, b| {
-        a["path"]
-            .as_str()
-            .cmp(&b["path"].as_str())
-            .then(a["http_method"].as_str().cmp(&b["http_method"].as_str()))
-            .then(a["route_id"].as_str().cmp(&b["route_id"].as_str()))
-    });
+    kortex_search::sort_with_control(
+        &mut items,
+        |a, b| {
+            a["path"]
+                .as_str()
+                .cmp(&b["path"].as_str())
+                .then(a["http_method"].as_str().cmp(&b["http_method"].as_str()))
+                .then(a["route_id"].as_str().cmp(&b["route_id"].as_str()))
+        },
+        control,
+    )?;
     let truncated = items.iter().any(|v| v["truncated"] == true);
     Ok(
         json!({"schema_version":"1.0","operation":"routes","items":items,"partial":!diagnostics.is_empty() || items.iter().any(|v|v["partial"]==true),"diagnostics":diagnostics,"truncated":truncated}),

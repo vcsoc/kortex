@@ -267,7 +267,10 @@ fn actual_cli_discovery_query_and_context_for_all_six_p1_languages() {
                 .env("USERPROFILE", &home)
                 .env("XDG_CONFIG_HOME", home.join("config"))
                 .env("XDG_CACHE_HOME", home.join("cache"))
-                .env("KORTEX_REGISTRY", base.path().join("registry.db"))
+                .env(
+                    "KORTEX_REGISTRY",
+                    base.path().join("private-registry/registry.db"),
+                )
                 .env(
                     "GIT_CONFIG_GLOBAL",
                     if cfg!(windows) { "NUL" } else { "/dev/null" },

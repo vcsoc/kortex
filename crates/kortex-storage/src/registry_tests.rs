@@ -52,7 +52,7 @@ fn registry_upsert_restart_and_remove_preserve_source_and_index() {
 
 #[test]
 fn independent_registry_connections_do_not_lose_entries() {
-    let d = tempfile::tempdir().unwrap();
+    let d = crate::test_support::tempdir().unwrap();
     let db = d.path().join("registry.db");
     let registry = Registry::at(&db).unwrap();
     let mut workers = vec![];
@@ -151,10 +151,10 @@ fn registry_environment_precedence_is_isolated_from_other_tests() {
 
 #[test]
 fn damaged_registry_is_reported_without_repair_or_data_loss() {
-    let d = tempfile::tempdir().unwrap();
+    let d = crate::test_support::tempdir().unwrap();
     let path = d.path().join("registry.db");
     let bytes = b"corrupt registry backup must remain";
-    fs::write(&path, bytes).unwrap();
+    crate::test_support::file(&path, bytes).unwrap();
     let error = Registry::at(&path).err().expect("corruption accepted");
     assert_eq!((error.code, error.exit), ("STORAGE_ERROR", 6));
     assert_eq!(fs::read(&path).unwrap(), bytes);
