@@ -346,7 +346,7 @@ impl ReadService {
                 let presence = session.query_parser_diagnostic_presence()?;
                 control.check()?;
                 let partial = presence.iter().any(|f| f.has_parser_diagnostics)
-                    || self.metadata.diagnostics.iter().any(|s| s.contains("truncated") || s.contains("refused"));
+                    || self.metadata.diagnostics.iter().any(|s| super::discovery_diagnostic_is_partial(s));
                 let _ = self.projected_partial.set(partial);
             }
             let indexed_partial = *self.projected_partial.get().ok_or_else(|| Error::new("INTERNAL_STATE", "pinned diagnostic evidence unavailable", 1))?;

@@ -4,6 +4,30 @@ use kortex_config::Config;
 use kortex_core::Result;
 use serde_json::{Value, json};
 use std::path::Path;
+pub(crate) fn init_index(base: &Path, config_path: Option<&Path>) -> Result<Value> {
+    let config = Config::load(base, config_path)?;
+    let root = config.resolved_root(base)?;
+    match kortex_analysis::ReadService::open_at_root(&root, config.clone()) {
+        Ok(service) => Ok(
+            json!({"status":"existing","repo_id":service.metadata().repo_id,"generation_id":service.metadata().generation_id}),
+        ),
+        Err(error) if error.code == "INDEX_NOT_FOUND" => {
+            let report = kortex_indexer::index_at_root(
+                &root,
+                &config,
+                &kortex_indexer::Options {
+                    verify: true,
+                    ..Default::default()
+                },
+            )?;
+            Ok(
+                json!({"status":"created","repo_id":report.snapshot.repo_id,"generation_id":report.snapshot.generation_id,"files":report.snapshot.files.len(),"symbols":report.snapshot.symbols().count(),"diagnostics":report.snapshot.diagnostics}),
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn one(path: &Path, args: &IndexArgs, config_path: Option<&Path>) -> Result<Value> {
     let base = kortex_repo::root(path)?;
     let mut config = Config::load(&base, config_path)?;

@@ -221,6 +221,36 @@ fn parser_partial_and_stale_source_are_truthful_without_top_level_diagnostics() 
 }
 
 #[test]
+fn oversized_source_marks_real_eager_and_lazy_query_results_partial() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("small.py"), "def target():\n    pass\n").unwrap();
+    std::fs::write(
+        temp.path().join("large.py"),
+        format!("#{}\n", "x".repeat(1024)),
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("notes.txt"), "not source").unwrap();
+    let mut config = Config::default();
+    config.repository.max_file_size_bytes = 128;
+    let report = kortex_indexer::index_at_root(temp.path(), &config, &Default::default()).unwrap();
+    assert!(
+        report
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("large.py") && d.contains("FILE_TOO_LARGE")),
+        "{:?}",
+        report.snapshot.diagnostics
+    );
+    let eager = Service::open_at_root(temp.path(), config.clone()).unwrap();
+    let lazy = ReadService::open_at_root(temp.path(), config).unwrap();
+    let response = compare(&eager, &lazy, &json!({"text":"target"}));
+    assert_eq!(response["partial"], true);
+    assert!(!response["data"]["items"].as_array().unwrap().is_empty());
+    assert!(!lazy.eager_materialized());
+}
+
+#[test]
 fn query_and_explicit_unsupported_fallback_remain_pinned_across_real_replacement() {
     let (temp, config) = fixture();
     let eager = Service::open_at_root(temp.path(), config.clone()).unwrap();
@@ -437,11 +467,12 @@ fn actual_cli_query_uses_lazy_dispatch_but_context_keeps_honest_eager_fallback()
 }
 
 #[test]
-fn top_level_partial_classification_is_unchanged_for_clean_truncated_and_refused_messages() {
+fn top_level_partial_classification_fails_closed_for_unknown_discovery_diagnostics() {
     let (temp, config) = fixture();
     let mut snapshot = Store::open(temp.path(), false).unwrap().load().unwrap();
     for (message, partial) in [
-        ("ordinary informational diagnostic", false),
+        ("README.md: unsupported language", false),
+        ("unknown discovery diagnostic", true),
         ("inventory truncated by budget", true),
         ("unsafe input refused", true),
     ] {

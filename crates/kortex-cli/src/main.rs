@@ -1,6 +1,7 @@
 //! Native Kortex command line. Machine stdout contains JSON/protocol traffic only.
 mod http;
 mod indexing;
+mod init;
 mod output;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use http::serve_http;
@@ -315,17 +316,31 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Init { path } => {
             let root = kortex_repo::root(&path)?;
-            let config_path = cli.config.unwrap_or_else(|| root.join(".kortex.toml"));
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| root.join(".kortex.toml"));
             let config = toml::to_string_pretty(&Config::default())
                 .map_err(|e| Error::new("INVALID_CONFIG", e.to_string(), 2))?;
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
+            let config_status = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&config_path)?;
-            file.write_all(config.as_bytes())?;
+                .open(&config_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(config.as_bytes())?;
+                    "created"
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => "existing",
+                Err(error) => return Err(error.into()),
+            };
+            let agents_status = init::install(&root, output)?;
+            let index = indexing::init_index(&root, cli.config.as_deref()).map_err(|error| {
+                Error::new(error.code, format!("Initialization wrote or preserved configuration and agent instructions, but indexing failed: {}. Retry init after resolving the error.", error.message), error.exit)
+            })?;
             emit(
-                json!({"config_path":config_path,"note":"Source ignore files were not modified. Run kortex index."}),
+                json!({"config_path":config_path,"config_status":config_status,"agents_path":root.join("AGENTS.md"),"agents_status":agents_status,"index":index,"note":"Source ignore files were not modified. Keep index data private."}),
                 output,
             );
         }

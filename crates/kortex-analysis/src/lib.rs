@@ -31,6 +31,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+// Unsupported non-source files are routinely skipped; every other discovery
+// diagnostic may indicate that source evidence is missing.
+fn discovery_diagnostic_is_partial(diagnostic: &str) -> bool {
+    !diagnostic.ends_with(": unsupported language")
+}
+
 pub struct Service {
     pub root: PathBuf,
     pub config: Config,
@@ -762,7 +768,7 @@ impl Service {
                         .snapshot
                         .diagnostics
                         .iter()
-                        .any(|s| s.contains("truncated") || s.contains("refused")),
+                        .any(|s| discovery_diagnostic_is_partial(s)),
                 truncated,
                 next_cursor,
                 data,

@@ -4,7 +4,7 @@ Run `kortex --help` and `kortex COMMAND --help` for the actual Clap contract. Gl
 
 | Command | Shipped behavior |
 |---|---|
-| init [path] | Create default TOML without overwriting or changing Git ignore files |
+| init [path] | Create default TOML and versioned `AGENTS.md` instructions if absent, then build a verified index if no committed index exists; never change Git ignore files |
 | index/analyze [path] | Discover, parse/cache, resolve and atomically commit |
 | watch [path] | Native events, default 500 ms debounce, two-second reconciliation; Ctrl-C shutdown |
 | status [path], doctor | Freshness, graph counts, diagnostics and SQLite integrity |
@@ -22,6 +22,8 @@ Run `kortex --help` and `kortex COMMAND --help` for the actual Clap contract. Gl
 | completion SHELL | bash, zsh, fish, powershell, elvish via clap_complete |
 | version | Version/index format and development status |
 | serve | `--mcp stdio` aliases the read-only stdio server; plain HTTP remains NOT_IMPLEMENTED P1 |
+
+`init` resolves the selected configuration and builds a verified index when that selection has no committed index. An existing committed index is left unchanged, not automatically refreshed; run `index --verify` to refresh it. Indexing writes private index and registry data and may fail after config or instructions have been created; resolve the error and retry. Only the currently selected configuration and storage are checked, so indexes under other configurations are not detected. `init` preserves an existing config and all `AGENTS.md` content outside the Kortex markers. It creates the file or appends the section when missing. Older section versions prompt on an interactive terminal; only `y` or `yes` approves replacement. JSON and non-interactive invocations leave older sections untouched and report `agents_status: update_declined`; newer versions are also left untouched. Malformed or duplicate markers are refused. The version is a Kortex instruction-content revision, not the Kortex application version. This does not configure an MCP client or install a Pi slash command.
 
 Selectors: symbol ID, exact qualified name, name (ambiguous names error), `path:name`, or `path:line`. Coordinates are 1-based UTF-8 bytes. No rename or source editing operation exists.
 
