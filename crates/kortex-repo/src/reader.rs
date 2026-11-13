@@ -1,15 +1,21 @@
 //! Request-local source capability. Cached handles are hints, never path authority.
 use kortex_core::{Error, RequestControl, Result};
 use std::path::{Path, PathBuf};
+#[path = "policy_read.rs"]
+mod policy_read;
+pub(crate) use policy_read::PolicyNode;
 
 #[cfg(all(test, unix))]
 type BeforeOpenHook = Option<Box<dyn FnOnce()>>;
 #[cfg(all(test, unix))]
 std::thread_local! {
     pub(crate) static BEFORE_OPEN_HOOK: std::cell::RefCell<BeforeOpenHook> = std::cell::RefCell::new(None);
+    pub(crate) static POLICY_OBSERVATION_HOOK: std::cell::RefCell<BeforeOpenHook> = std::cell::RefCell::new(None);
 }
 
-/// Operations issued by this reader, including failed opens and EOF reads.
+/// Byte-read operations, including failed opens and EOF reads. The additive
+/// policy API's metadata-only probes are not counted as parent/file operations;
+/// their root validations and all actual policy byte reads ARE counted.
 /// `read_calls` counts `Read::read` calls (including `Take`'s limit EOF), not
 /// kernel syscalls. Capability-internal Windows traversal is not counted as
 /// parent opens/checks. Discovery's external canonicalization is not counted.
@@ -32,6 +38,8 @@ pub struct ConfinedReadStats {
 pub struct ConfinedReader {
     root: PathBuf,
     backend: platform::Root,
+    // Reuse capacity only; stale contents never substitute for actual returned bytes.
+    scratch: Box<crate::confined::ReadScratch>,
     stats: ConfinedReadStats,
 }
 
@@ -43,6 +51,7 @@ impl ConfinedReader {
         Ok(Self {
             root: root.to_owned(),
             backend: platform::Root::new(root)?,
+            scratch: Box::new([0; crate::confined::READ_CHUNK_BYTES]),
             stats: ConfinedReadStats {
                 root_opens: 1,
                 canonicalizations: 1,
@@ -53,6 +62,14 @@ impl ConfinedReader {
 
     pub fn stats(&self) -> &ConfinedReadStats {
         &self.stats
+    }
+
+    pub(crate) fn policy_root_identity(
+        &mut self,
+        control: &RequestControl,
+    ) -> Result<(i128, u128)> {
+        self.validate(Some(control))?;
+        self.backend.policy_identity()
     }
 
     pub(crate) fn validate(&mut self, control: Option<&RequestControl>) -> Result<()> {
@@ -85,8 +102,8 @@ impl ConfinedReader {
         self.read_resolved(&canonical, max, control)
     }
 
-    // Discovery already resolved this entry for alias deduplication. Reusing that
-    // result removes a second canonicalization, NOT the confined opened-file checks.
+    // Discovery supplies a resolved alias target or a lexical no-link walk
+    // candidate. Neither bypasses full descriptor-relative component validation.
     pub(crate) fn read_resolved(
         &mut self,
         canonical: &Path,
@@ -104,8 +121,14 @@ impl ConfinedReader {
         {
             return Err(refused("non-normal confined path"));
         }
-        self.backend
-            .read(&self.root, relative, max, control, &mut self.stats)
+        self.backend.read(
+            &self.root,
+            relative,
+            max,
+            control,
+            &mut self.stats,
+            &mut self.scratch,
+        )
     }
 }
 
@@ -114,6 +137,36 @@ pub(crate) fn text(bytes: Vec<u8>) -> Result<String> {
         return Err(Error::new("BINARY_FILE", "binary file", 7));
     }
     String::from_utf8(bytes).map_err(|_| Error::new("INVALID_ENCODING", "not UTF-8", 7))
+}
+
+// Metadata-only role checking on explicitly granted canonical scope ancestry.
+// Never supplies an opener/anchor for actual file bytes.
+pub(crate) fn policy_ancestor_identity(
+    path: &Path,
+    control: &RequestControl,
+) -> Result<(i128, u128)> {
+    control.check()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(refused("operator scope ancestry is not a real directory"));
+        }
+        Ok((metadata.dev().into(), metadata.ino().into()))
+    }
+    #[cfg(windows)]
+    {
+        use cap_fs_ext::MetadataExt;
+        let directory = crate::confined::windows_root(path)?;
+        let metadata = directory.dir_metadata()?;
+        Ok((metadata.dev().into(), metadata.ino().into()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(refused("operator ancestry identity unsupported"))
+    }
 }
 
 fn refused(message: &str) -> Error {
@@ -148,6 +201,19 @@ mod platform {
     }
 
     impl Root {
+        pub(super) fn policy_identity(&self) -> Result<(i128, u128)> {
+            Ok((self.identity.dev().into(), self.identity.ino().into()))
+        }
+
+        pub(super) fn policy_observe(
+            &self,
+            relative: &Path,
+            required_parents: usize,
+            control: &RequestControl,
+        ) -> Result<super::policy_read::Observation> {
+            super::policy_read::observe_unix(&self.file, relative, required_parents, control)
+        }
+
         pub(super) fn new(root: &Path) -> Result<Self> {
             let file = File::from(
                 open(
@@ -245,6 +311,7 @@ mod platform {
             max: u64,
             control: Option<&RequestControl>,
             stats: &mut ConfinedReadStats,
+            scratch: &mut crate::confined::ReadScratch,
         ) -> Result<Vec<u8>> {
             self.check_root(root, stats)?;
             let names: Vec<_> = relative.components().map(|c| c.as_os_str()).collect();
@@ -255,7 +322,9 @@ mod platform {
                 if !file.metadata()?.is_file() {
                     return Err(refused("not a regular file"));
                 }
-                let bytes = crate::confined::read_opened_bytes_counted(file, max, control, stats)?;
+                let bytes = crate::confined::read_opened_bytes_with_scratch(
+                    file, max, control, stats, scratch,
+                )?;
                 crate::checkpoint(control)?;
                 let (_after_file, after) = self.walk_deep(relative, control, stats)?;
                 if before.iter().zip(&after).any(|(a, b)| !same(a, b)) {
@@ -322,7 +391,9 @@ mod platform {
             if !rustix::fs::FileType::from_raw_mode(identity.st_mode).is_file() {
                 return Err(refused("not a regular file"));
             }
-            let bytes = crate::confined::read_opened_bytes_counted(file, max, control, stats)?;
+            let bytes = crate::confined::read_opened_bytes_with_scratch(
+                file, max, control, stats, scratch,
+            )?;
             crate::checkpoint(control)?;
             self.check_parents(stats, control)?;
             let above = self.parents.last().map_or(&self.file, |p| &p.file);
@@ -344,6 +415,20 @@ mod platform {
     use super::*;
     pub(super) struct Root(cap_std::fs::Dir);
     impl Root {
+        pub(super) fn policy_identity(&self) -> Result<(i128, u128)> {
+            use cap_fs_ext::MetadataExt;
+            let metadata = self.0.dir_metadata()?;
+            Ok((metadata.dev().into(), metadata.ino().into()))
+        }
+
+        pub(super) fn policy_observe(
+            &self,
+            relative: &Path,
+            required_parents: usize,
+            control: &RequestControl,
+        ) -> Result<super::policy_read::Observation> {
+            super::policy_read::observe_windows(&self.0, relative, required_parents, control)
+        }
         pub(super) fn new(root: &Path) -> Result<Self> {
             Ok(Self(crate::confined::windows_root(root)?))
         }
@@ -359,11 +444,12 @@ mod platform {
             max: u64,
             control: Option<&RequestControl>,
             stats: &mut ConfinedReadStats,
+            scratch: &mut crate::confined::ReadScratch,
         ) -> Result<Vec<u8>> {
             crate::checkpoint(control)?;
             stats.file_opens += 1;
             let file = crate::confined::windows_open(&self.0, relative)?;
-            crate::confined::read_opened_bytes_counted(file, max, control, stats)
+            crate::confined::read_opened_bytes_with_scratch(file, max, control, stats, scratch)
         }
     }
 }
@@ -373,6 +459,18 @@ mod platform {
     use super::*;
     pub(super) struct Root;
     impl Root {
+        pub(super) fn policy_identity(&self) -> Result<(i128, u128)> {
+            Err(refused("policy directory identity unsupported"))
+        }
+
+        pub(super) fn policy_observe(
+            &self,
+            _relative: &Path,
+            _required_parents: usize,
+            _control: &RequestControl,
+        ) -> Result<super::policy_read::Observation> {
+            Err(refused("confined policy observation unsupported"))
+        }
         pub(super) fn new(_: &Path) -> Result<Self> {
             Err(refused("confined reads unsupported"))
         }
@@ -386,6 +484,7 @@ mod platform {
             _: u64,
             _: Option<&RequestControl>,
             _: &mut ConfinedReadStats,
+            _: &mut crate::confined::ReadScratch,
         ) -> Result<Vec<u8>> {
             Err(refused("confined reads unsupported"))
         }

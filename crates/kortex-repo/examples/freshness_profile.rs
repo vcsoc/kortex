@@ -65,6 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     let count: usize = args.get(1).map_or("10000", String::as_str).parse()?;
     let nested = args.get(2).is_some_and(|a| a == "nested");
+    let samples: usize = args.get(3).map_or("10", String::as_str).parse()?;
+    let functions: usize = args.get(4).map_or("0", String::as_str).parse()?;
+    assert!(samples >= 10, "diagnostics require at least ten samples");
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("repo");
     fs::create_dir(&root)?;
@@ -74,22 +77,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut expected = BTreeMap::new();
     let mut source_bytes = 0usize;
     for index in 0..count {
-        let name = if nested {
-            format!("group_{:03}/source_{index:05}.rs", index / 100)
-        } else {
+        let leaf = if functions == 0 {
             format!("source_{index:05}.rs")
+        } else {
+            format!("m{index:05}.py")
         };
-        let source =
-            format!("pub fn source_{index:05}(value: usize) -> usize {{ value + {index} }}\n");
-        fixture.update(name.as_bytes());
-        fixture.update(source.as_bytes());
+        let name = if nested {
+            format!("group_{:03}/{leaf}", index / 100)
+        } else {
+            leaf
+        };
+        let source = if functions == 0 {
+            format!("pub fn source_{index:05}(value: usize) -> usize {{ value + {index} }}\n")
+        } else {
+            // Same inert flat source/function shape and framing as query_profile.
+            let mut source = format!("from m{:05} import f0 as next_call\n", (index + 1) % count);
+            for function in 0..functions {
+                source.push_str(&format!("def f{function}():\n    next_call()\n"));
+            }
+            source
+        };
         fixture_bytes.extend_from_slice(name.as_bytes());
+        if functions != 0 {
+            fixture_bytes.push(0);
+        }
         fixture_bytes.extend_from_slice(source.as_bytes());
         source_bytes += source.len();
         fs::create_dir_all(root.join(&name).parent().unwrap())?;
         fs::write(root.join(&name), &source)?;
         expected.insert(name, kortex_core::hash(&source));
     }
+    fixture.update(&fixture_bytes);
     // Optional independent SHA-256 tool hashes exactly the same name+source byte
     // stream as BLAKE3. It does NOT execute any fixture source or repository tool.
     let digest_input = temp.path().join("fixture-bytes");
@@ -104,12 +122,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| "unavailable".into());
     println!(
-        "DIAGNOSTIC_NOT_ACCEPTANCE files={count} layout={} source_bytes={source_bytes} fixture_blake3={} fixture_sha256={sha256} hash_framing=concatenated_name_then_source_in_generation_order",
+        "DIAGNOSTIC_NOT_ACCEPTANCE files={count} functions={} samples={samples} layout={} source_bytes={source_bytes} fixture_blake3={} fixture_sha256={sha256} hash_framing={}",
+        count * functions,
         if nested { "nested100" } else { "flat" },
-        fixture.finalize().to_hex()
+        fixture.finalize().to_hex(),
+        if functions == 0 {
+            "name_then_source"
+        } else {
+            "name_NUL_source"
+        },
     );
     let config = kortex_config::Config::default();
-    for run in 0..5 {
+    let mut canonicalizing_config = config.clone();
+    // The fixture contains NO symlinks. Enabling follow_links selects the retained
+    // canonicalization branch with identical topology, reads and identity checks.
+    canonicalizing_config.repository.follow_symlinks = true;
+    for run in 0..samples {
         let control = RequestControl::new(Duration::from_secs(120))?;
         println!("run={run}");
         let start = Instant::now();
@@ -159,18 +187,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } {
             read_phase(&root, &expected, shared, &control)?;
         }
-        let start = Instant::now();
-        let inventory = kortex_repo::discover_with_control(&root, &config, &control)?;
-        let elapsed = start.elapsed();
-        assert_eq!(inventory.files.len(), count);
-        assert!(inventory.diagnostics.is_empty());
-        for file in &inventory.files {
-            assert_eq!(expected.get(&file.path), Some(&file.content_hash));
+        let mut inventories = Vec::new();
+        for canonicalizing in if run % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        } {
+            let (inventory, stats) = kortex_repo::discover_profiled(
+                &root,
+                if canonicalizing {
+                    &canonicalizing_config
+                } else {
+                    &config
+                },
+                &control,
+            )?;
+            assert_eq!(inventory.files.len(), count);
+            assert!(inventory.diagnostics.is_empty());
+            assert_eq!(stats.reader.bytes_read, source_bytes as u64);
+            for file in &inventory.files {
+                assert_eq!(expected.get(&file.path), Some(&file.content_hash));
+                assert_eq!(kortex_core::hash(&file.source), file.content_hash);
+            }
+            println!(
+                "phase={} files={count} bytes={source_bytes} elapsed_ms={:.3} stats={stats:?}",
+                if canonicalizing {
+                    "canonicalizing_discovery_read_hash"
+                } else {
+                    "production_discovery_read_hash"
+                },
+                stats.total.as_secs_f64() * 1000.0,
+            );
+            inventories.push(inventory);
         }
-        println!(
-            "phase=production_discovery_read_hash files={count} bytes={source_bytes} elapsed_ms={:.3}",
-            elapsed.as_secs_f64() * 1000.0
+        assert_eq!(
+            inventories[0]
+                .files
+                .iter()
+                .map(|f| (&f.path, &f.source, &f.content_hash))
+                .collect::<Vec<_>>(),
+            inventories[1]
+                .files
+                .iter()
+                .map(|f| (&f.path, &f.source, &f.content_hash))
+                .collect::<Vec<_>>(),
+            "exact canonicalizing vs descriptor-relative inventory order/bytes/hashes",
         );
+        let inventory = inventories.pop().unwrap();
         let start = Instant::now();
         for file in &inventory.files {
             control.check()?;
@@ -180,6 +243,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "phase=resident_rehash bytes={source_bytes} hash_calls={count} elapsed_ms={:.3}",
             start.elapsed().as_secs_f64() * 1000.0
         );
+        // Sample resident memory OUTSIDE phase timers. This is not a phase peak;
+        // /usr/bin/time separately records whole-process maximum resident memory.
+        #[cfg(unix)]
+        {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()?;
+            assert!(output.status.success(), "RSS sampler failed");
+            let kib: u64 = std::str::from_utf8(&output.stdout)?.trim().parse()?;
+            println!(
+                "phase=sample_resident_memory run={run} rss_bytes={}",
+                kib.checked_mul(1024).ok_or("RSS overflow")?
+            );
+        }
     }
     Ok(())
 }

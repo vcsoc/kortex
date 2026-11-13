@@ -22,6 +22,7 @@ IMAGE = "rust@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0b
 EXCLUDE = {"target", ".git", ".kortex", "node_modules", "__pycache__"}
 LABEL = "io.kortex.local-linux-validation.owner"
 JOURNEY = "actual_cli_discovery_query_and_context_for_all_six_p1_languages"
+ANALYSIS_PROOF = "read_query_tests::actual_cli_query_uses_lazy_dispatch_but_context_keeps_honest_eager_fallback"
 
 
 def source_inputs(root):
@@ -95,6 +96,10 @@ def test_evidence(text):
                    in journey for language in ("java", "csharp", "c", "cpp", "ruby", "php"))
     actual = (journey_code == 0 and required and f"test {JOURNEY} ... ok" in journey
               and "test result: ok. 1 passed; 0 failed;" in journey)
+    analysis, analysis_code = phase(text, "analysis-proof")
+    analysis_actual = (analysis_code == 0 and f"test {ANALYSIS_PROOF} ... ok" in analysis
+                       and "test result: ok. 1 passed; 0 failed;" in analysis
+                       and "actual CLI BLAKE3 " in analysis)
     return {"workspace_passed": code == 0 and bool(summaries)
             and sum(p for p, _, _ in summaries) > 0
             and all(f == 0 for _, f, _ in summaries)
@@ -104,7 +109,16 @@ def test_evidence(text):
             "workspace_ignored_tests": sum(i for _, _, i in summaries),
             "workspace_summarized_targets": len(summaries),
             "workspace_exit_code": code, "six_language_cli_journey_passed": actual,
-            "journey_exit_code": journey_code}
+            "journey_exit_code": journey_code,
+            "analysis_lazy_cli_proof_passed": analysis_actual,
+            "analysis_proof_exit_code": analysis_code}
+
+
+def require_cache_provenance(seed, state=None):
+    if seed is not None:
+        raise ValueError("imported Cargo targets have no byte-bound provenance; use a fresh volume")
+    if state is not None and state.get("cache_provenance") != "unseeded-v1":
+        raise ValueError("resume cache lacks unseeded provenance; retain it and use a fresh volume")
 
 
 def mount(kind, source, guest, readonly=False, extra=""):
@@ -126,19 +140,13 @@ stat -c '%Y %y %n' /src/Cargo.lock /src/crates/kortex-cli/src/main.rs
 df -h /build /src; cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/pids.max
 cat /proc/meminfo /proc/loadavg; ls /sys/class/net
 printf 'VALIDATION_METADATA END\n'
-if [ -d /old/debug ] && [ ! -e /build/.seeded ]; then
-  printf 'VALIDATION_SEED BEGIN\n'
-  cp -a /old/debug /build/debug
-  touch /build/.seeded
-  printf 'VALIDATION_SEED END\n'
-fi
 set +e
 printf 'VALIDATION_PHASE=workspace BEGIN\n'
 CARGO_LOG=cargo::compiler::fingerprint=debug cargo test --workspace --all-features --locked --offline --no-fail-fast -j 4
 workspace=$?
 printf 'VALIDATION_PHASE=workspace EXIT=%s\n' "$workspace"
 printf 'VALIDATION_PHASE=build BEGIN\n'
-cargo build -p kortex-cli --all-features --locked --offline -j 4
+cargo build --workspace --all-features --locked --offline -j 4
 build=$?
 printf 'VALIDATION_PHASE=build EXIT=%s\n' "$build"
 if [ "$build" -ne 0 ]; then exit "$build"; fi
@@ -150,7 +158,11 @@ printf 'VALIDATION_PHASE=journey BEGIN\n'
 KORTEX_TEST_CLI=/build/debug/kortex cargo test -p kortex-indexer --test p1_discovery --all-features --locked --offline -j 4 actual_cli_discovery_query_and_context_for_all_six_p1_languages -- --ignored --exact --nocapture
 journey=$?
 printf 'VALIDATION_PHASE=journey EXIT=%s\n' "$journey"
-if [ "$workspace" -ne 0 ] || [ "$journey" -ne 0 ]; then exit 1; fi
+printf 'VALIDATION_PHASE=analysis-proof BEGIN\n'
+KORTEX_TEST_CLI=/build/debug/kortex cargo test --workspace --lib --all-features --locked --offline -j 4 read_query_tests::actual_cli_query_uses_lazy_dispatch_but_context_keeps_honest_eager_fallback -- --ignored --exact --nocapture
+analysis=$?
+printf 'VALIDATION_PHASE=analysis-proof EXIT=%s\n' "$analysis"
+if [ "$workspace" -ne 0 ] || [ "$journey" -ne 0 ] || [ "$analysis" -ne 0 ]; then exit 1; fi
 printf 'VALIDATION_PHASE=install BEGIN\n'
 set -e
 # This is a private debug executable install/extraction smoke, not release packaging.
@@ -203,7 +215,7 @@ def smoke_evidence(run, text):
 def container(docker, run, owner, name, options, script, seconds, root=False):
     """Both watchdogs bound execution; forcibly remove only our named container."""
     command = docker + ["create", "--pull=never", "--name", name, "--label", f"{LABEL}={owner}",
-                        "--init", "--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                        "--init", "--read-only", "--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                         "--cpus=4", "--memory=8g", "--memory-swap=8g", "--pids-limit=1024",
                         "--user=0:0" if root else "--user=501:20"]
     if root:
@@ -215,6 +227,8 @@ def container(docker, run, owner, name, options, script, seconds, root=False):
         created = True
         inspection = json.loads(subprocess.check_output(docker + ["inspect", name], timeout=10))[0]
         (run / f"{name}-inspect.json").write_text(json.dumps(inspection, indent=2) + "\n")
+        if inspection.get("HostConfig", {}).get("ReadonlyRootfs") is not True:
+            raise ValueError("container root filesystem is not verified read-only")
         with (run / f"{name}.log").open("w") as log:
             result = subprocess.run(docker + ["start", "--attach", name], stdout=log,
                                     stderr=subprocess.STDOUT, timeout=seconds + 30)
@@ -233,9 +247,10 @@ def main():
     parser.add_argument("--expected-source-sha256", required=True)
     parser.add_argument("--expected-source-files", type=int, required=True)
     parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument("--seed-cache", type=Path, help="read-only prior target; copied preserving mtimes into new private volume")
+    parser.add_argument("--seed-cache", type=Path, help="legacy option; imported targets are refused without byte-bound provenance")
     parser.add_argument("--resume", type=Path, help="reuse only this runner's labeled cache-state.json")
     args = parser.parse_args()
+    require_cache_provenance(args.seed_cache)
     if not hasattr(os, "getuid") or (os.getuid(), os.getgid()) != (501, 20) or not 30 <= args.timeout <= 1800:
         parser.error("requires non-root host UID501:GID20 and timeout 30..1800 seconds")
     source, inputs = pinned_snapshot(args.snapshot, args.expected_source_sha256, args.expected_source_files)
@@ -270,6 +285,7 @@ def main():
                                          "--label", "io.kortex.scope=private-offline-validation", volume], timeout=10)
     else:
         state = json.loads(args.resume.read_text())
+        require_cache_provenance(None, state)
         if (state["image"], state["endpoint"], state["source_sha256"]) != (IMAGE, endpoint, args.expected_source_sha256):
             raise ValueError("cache resume identity differs")
         owner, volume = state["owner"], state["volume"]
@@ -277,14 +293,23 @@ def main():
     if volume_info["Driver"] != "local" or volume_info.get("Options") or volume_info.get("Labels", {}).get(LABEL) != owner:
         raise ValueError("cache volume is not this runner's private local volume")
     state = {"owner": owner, "volume": volume, "image": IMAGE, "endpoint": endpoint,
-             "source_sha256": args.expected_source_sha256}
+             "source_sha256": args.expected_source_sha256, "cache_provenance": "unseeded-v1"}
     (run / "cache-state.json").write_text(json.dumps(state, indent=2) + "\n")
     (run / "cache-state.json").chmod(0o600)
+    runner_bytes = Path(__file__).read_bytes()
+    runner_snapshot = run / "executed-runner.py"
+    runner_snapshot.write_bytes(runner_bytes)
     report = {**state, "source_snapshot": str(source), "source_files": len(inputs),
               "scope": "frozen-snapshot native ARM64 Linux VM functional evidence; not current live source, x86/Windows, hardware performance, power-loss or production acceptance",
               "image_id": image["Id"], "engine": {key: info[key] for key in
                   ("ServerVersion", "KernelVersion", "Architecture", "NCPU", "MemTotal", "ContainersRunning")},
               "network": "none", "uploaded": False, "source_mount": "readonly", "registry_mount": "readonly",
+              "runner_path": str(Path(__file__).resolve()),
+              "runner_sha256": hashlib.sha256(runner_bytes).hexdigest(),
+              "runner_snapshot": str(runner_snapshot),
+              "seed_cache_requested": args.seed_cache is not None,
+              "resumed_cache_requested": args.resume is not None,
+              "root_filesystem_readonly": None,
               "container_uid": 501, "container_gid": 20, "native_target_volume": volume,
               "timeout_seconds": args.timeout, "linux_runtime_passed": False, "private_install_passed": False,
               "evidence_directory": str(run)}
@@ -310,12 +335,6 @@ def main():
         options = (mount("bind", source, "/src", True) + mount("volume", volume, "/build", extra=",volume-nocopy")
                    + mount("volume", volume, "/work", extra=",volume-nocopy,volume-subpath=work")
                    + mount("bind", registry, "/work/cargo/registry", True) + mount("bind", run, "/evidence"))
-        if args.seed_cache:
-            seed = args.seed_cache.absolute()
-            if seed.resolve() != seed or not seed.is_relative_to(base) or not (seed / "debug").is_dir():
-                raise ValueError("seed must be a non-aliased existing target under the validation evidence root")
-            options += mount("bind", seed, "/old", True)
-            report["seed_cache_readonly"] = str(seed)
         environment = {"HOME": "/work/home", "CARGO_HOME": "/work/cargo", "CARGO_TARGET_DIR": "/build",
                        "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never", "RUSTUP_HOME": "/usr/local/rustup",
                        "RUSTUP_TOOLCHAIN": "1.99.1", "KORTEX_REGISTRY": "/work/home/registry.db",
@@ -328,6 +347,7 @@ def main():
         report["container_name"] = name
         output.write_text(json.dumps(report, indent=2) + "\n")
         code = container(docker, run, owner, name, options, SCRIPT, args.timeout)
+        report["root_filesystem_readonly"] = True
         text = Path(report["log"]).read_text(errors="replace")
         report.update(test_evidence(text))
         report["exit_code"] = code
@@ -336,6 +356,7 @@ def main():
         report["private_install_passed"] = smoke_evidence(run, text)
         report["linux_runtime_passed"] = (code == 0 and report["workspace_passed"]
                                           and report["six_language_cli_journey_passed"]
+                                          and report["analysis_lazy_cli_proof_passed"]
                                           and report["private_install_passed"])
         if source_inputs(source) != inputs:
             report["linux_runtime_passed"] = False

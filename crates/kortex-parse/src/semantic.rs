@@ -1,6 +1,7 @@
 //! AST-only value/type facts. Receiver types are deliberately not inferred.
+use super::Sink;
 use super::{join, span, split_name, text};
-use kortex_core::{ParsedFile, Reference, Symbol, hash, id};
+use kortex_core::{ParsedFile, Reference, Result, Symbol, hash, id};
 use serde_json::json;
 use tree_sitter::Node;
 
@@ -100,14 +101,14 @@ fn parameter(n: Node<'_>) -> bool {
 fn add_symbol(
     n: Node<'_>,
     source: &str,
-    file: &mut ParsedFile,
+    file: &mut Sink,
     owner: &str,
     kind: &str,
     binding: bool,
-) {
+) -> Result<()> {
     let name = text(n, source);
     let Some(parent) = file.symbols.iter().find(|s| s.symbol_id == owner) else {
-        return;
+        return Ok(());
     };
     let prefix = if parent.kind == "file" {
         ""
@@ -128,13 +129,13 @@ fn add_symbol(
                 && s.attributes["scope_end"].as_u64() == Some(scope.end_byte() as u64)
         })
     {
-        return;
+        return Ok(());
     }
     if file.symbols.iter().any(|s| {
         s.attributes["name_start"].as_u64() == Some(n.start_byte() as u64)
             && s.attributes["name_end"].as_u64() == Some(n.end_byte() as u64)
     }) {
-        return;
+        return Ok(());
     }
     let ordinal = file
         .symbols
@@ -156,7 +157,7 @@ fn add_symbol(
     }
     let exported = super::exported(declaration, source).0;
     let visibility = visibility(declaration, source, &file.language, name);
-    file.symbols.push(Symbol {
+    file.symbol(Symbol {
         symbol_revision_id: id(&[&symbol_id, &hash(text(declaration, source))]),
         symbol_id, repo_id: repo, kind: kind.into(), language: file.language.clone(), name: name.into(),
         qualified_name: qualified, file_path: file.path.clone(), span: span(n),
@@ -167,17 +168,18 @@ fn add_symbol(
             "scope_end": scope.end_byte(), "exported": exported,
             "syntax_error": declaration.has_error(), "source_snippet": text(declaration, source).chars().take(512).collect::<String>()}),
         content_hash: hash(text(declaration, source)), doc_comment: None, owner_id: Some(owner.into()),
-    });
+    })?;
+    Ok(())
 }
 
-pub(super) fn binding(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str) {
+pub(super) fn binding(n: Node<'_>, source: &str, file: &mut Sink, owner: &str) -> Result<()> {
     let mut stack = vec![n];
     let mut visited = 0;
     while let Some(n) = stack.pop() {
+        file.checkpoint()?;
         visited += 1;
         if visited > 4096 {
-            file.diagnostics
-                .push("binding expansion limit reached".into());
+            file.extraction_limit("binding expansion limit reached")?;
             break;
         }
         if matches!(
@@ -197,7 +199,7 @@ pub(super) fn binding(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &
             } else {
                 "variable"
             };
-            add_symbol(n, source, file, owner, kind, true);
+            add_symbol(n, source, file, owner, kind, true)?;
         } else if n.kind().contains("pattern")
             || matches!(n.kind(), "expression_list" | "tuple" | "list")
         {
@@ -210,30 +212,34 @@ pub(super) fn binding(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &
                 {
                     continue;
                 }
+                file.pending_expansion(
+                    visited,
+                    stack.len().saturating_add(1),
+                    4096,
+                    "binding expansion limit reached",
+                )?;
                 stack.push(child);
             }
         }
     }
+    Ok(())
 }
 
-pub(super) fn members(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str) {
+pub(super) fn members(n: Node<'_>, source: &str, file: &mut Sink, owner: &str) -> Result<()> {
     if matches!(n.kind(), "global_statement" | "nonlocal_statement") {
-        if let Some(s) = file.symbols.iter_mut().find(|s| s.symbol_id == owner) {
-            if !s.attributes["unsupported_bindings"].is_array() {
-                s.attributes["unsupported_bindings"] = json!([]);
+        if let Some(i) = file.symbols.iter().position(|s| s.symbol_id == owner) {
+            if !file.symbols[i].attributes["unsupported_bindings"].is_array() {
+                file.attribute(i, "unsupported_bindings", json!([]))?;
             }
             let mut c = n.walk();
             for name in n
                 .named_children(&mut c)
                 .filter(|child| child.kind() == "identifier")
             {
-                s.attributes["unsupported_bindings"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!(text(name, source)));
+                file.append_attribute(i, "unsupported_bindings", json!(text(name, source)))?;
             }
         }
-        return;
+        return Ok(());
     }
     if matches!(
         n.kind(),
@@ -242,28 +248,25 @@ pub(super) fn members(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &
             | "constrained_type_parameter"
             | "optional_type_parameter"
     ) {
-        if let Some(s) = file.symbols.iter_mut().find(|s| s.symbol_id == owner) {
-            if !s.attributes["type_bindings"].is_array() {
-                s.attributes["type_bindings"] = json!([]);
+        if let Some(i) = file.symbols.iter().position(|s| s.symbol_id == owner) {
+            if !file.symbols[i].attributes["type_bindings"].is_array() {
+                file.attribute(i, "type_bindings", json!([]))?;
             }
             let mut c = n.walk();
             for name in n
                 .named_children(&mut c)
                 .filter(|child| n.child_by_field_name("name") == Some(*child))
             {
-                s.attributes["type_bindings"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!(text(name, source)));
+                file.append_attribute(i, "type_bindings", json!(text(name, source)))?;
             }
         }
-        return;
+        return Ok(());
     }
     let kind = match n.kind() {
         "field_declaration" => "field",
         "public_field_definition" | "field_definition" | "property_signature" => "property",
         "const_spec" => "constant",
-        _ => return,
+        _ => return Ok(()),
     };
     let mut c = n.walk();
     for child in n.named_children(&mut c) {
@@ -278,9 +281,10 @@ pub(super) fn members(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &
                     | "private_property_identifier"
             )
         {
-            add_symbol(child, source, file, owner, kind, kind == "constant");
+            add_symbol(child, source, file, owner, kind, kind == "constant")?;
         }
     }
+    Ok(())
 }
 
 fn import_or_metadata(n: Node<'_>) -> bool {
@@ -391,31 +395,24 @@ fn ignored_name(n: Node<'_>, file: &ParsedFile) -> bool {
     false
 }
 
-pub(super) fn mutation(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str) {
+pub(super) fn mutation(n: Node<'_>, source: &str, file: &mut Sink, owner: &str) -> Result<()> {
     if let Some(left) = n.child_by_field_name("left")
         && left.kind() == "identifier"
     {
         let scope = declaration_scope(n, &file.language);
-        if let Some(s) = file.symbols.iter_mut().find(|s| s.symbol_id == owner) {
-            if !s.attributes["mutated_bindings"].is_array() {
-                s.attributes["mutated_bindings"] = json!([]);
-            }
-            s.attributes["mutated_bindings"].as_array_mut().unwrap().push(json!({"name": text(left, source), "start": n.start_byte(), "end": scope.end_byte()}));
+        if let Some(i) = file.symbols.iter().position(|s| s.symbol_id == owner) {
+            file.append_attribute(i, "mutated_bindings", json!({"name": text(left, source), "start": n.start_byte(), "end": scope.end_byte()}))?;
         }
     }
+    Ok(())
 }
-pub(super) fn unknown_receiver(file: &mut ParsedFile, owner: &str, start_byte: usize) {
-    if let Some(s) = file.symbols.iter_mut().find(|s| s.symbol_id == owner) {
-        if !s.attributes["runtime_receiver_sites"].is_array() {
-            s.attributes["runtime_receiver_sites"] = json!([]);
-        }
-        s.attributes["runtime_receiver_sites"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(start_byte));
+pub(super) fn unknown_receiver(file: &mut Sink, owner: &str, start_byte: usize) -> Result<()> {
+    if let Some(i) = file.symbols.iter().position(|s| s.symbol_id == owner) {
+        file.append_attribute(i, "runtime_receiver_sites", json!(start_byte))?;
     }
+    Ok(())
 }
-pub(super) fn reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str) {
+pub(super) fn reference(n: Node<'_>, source: &str, file: &mut Sink, owner: &str) -> Result<()> {
     if !aggregate(n)
         && !matches!(
             n.kind(),
@@ -427,10 +424,10 @@ pub(super) fn reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner:
                 | "shorthand_field_identifier"
         )
     {
-        return;
+        return Ok(());
     }
     if ignored_name(n, file) {
-        return;
+        return Ok(());
     }
     let is_type = type_context(n);
     let mut child = n;
@@ -443,39 +440,40 @@ pub(super) fn reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner:
             callee_part = false;
         }
         if import_or_metadata(p) {
-            return;
+            return Ok(());
         }
         if aggregate(p) {
-            return;
+            return Ok(());
         } // the complete qualified name is emitted once
         if !is_type
             && callee_part
             && matches!(p.kind(), "call" | "call_expression")
             && p.child_by_field_name("function") == Some(child)
         {
-            return;
+            return Ok(());
         }
         if p.kind() == "lifetime" {
-            return;
+            return Ok(());
         }
         child = p;
     }
     let full = text(n, source);
     if full.contains(['(', ')', '[', ']', ' ', '\n', '?']) {
-        return;
+        return Ok(());
     }
     let (qualifier, name) = split_name(full);
     if name.is_empty() {
-        return;
+        return Ok(());
     }
     if file.language == "rust" && n.kind() == "field_expression" {
-        unknown_receiver(file, owner, n.start_byte());
+        unknown_receiver(file, owner, n.start_byte())?;
     }
-    file.references.push(Reference {
+    file.reference(Reference {
         source_id: owner.into(),
         name: name.into(),
         qualifier: qualifier.map(str::to_owned),
         span: span(n),
         kind: if is_type { "USES_TYPE" } else { "REFERENCES" }.into(),
-    });
+    })?;
+    Ok(())
 }

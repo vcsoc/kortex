@@ -1349,12 +1349,15 @@ dependencies = [
 name = "kortex-config"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "kortex-core",
  "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1472,8 +1475,11 @@ dependencies = [
  "kortex-config",
  "kortex-core",
  "notify",
+ "regex-automata",
  "rustix",
  "serde",
+ "sha1",
+ "sha2",
  "tempfile",
  "toml",
  "windows-sys 0.61.2",
@@ -2383,6 +2389,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

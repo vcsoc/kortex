@@ -1,7 +1,10 @@
 //! Strict configuration; repository policy cannot enable outbound services.
 mod policy;
+mod repo_config;
+mod resources;
 use kortex_core::{Error, Result};
 use policy::{read_config, validate_http, validate_repository_policy, validate_search};
+pub use resources::ResourceLimits;
 #[cfg(test)]
 mod readiness_tests;
 use serde::{Deserialize, Serialize};
@@ -58,6 +61,8 @@ pub struct Index {
     pub workers: usize,
     pub watch_debounce_ms: u64,
     pub storage: String,
+    #[serde(skip_serializing_if = "ResourceLimits::is_default")]
+    pub resources: ResourceLimits,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -119,6 +124,7 @@ impl Default for Index {
             workers: 0,
             watch_debounce_ms: 500,
             storage: "repository".into(),
+            resources: ResourceLimits::default(),
         }
     }
 }
@@ -217,6 +223,11 @@ impl Config {
         let root = invocation_root.as_path();
         let explicit = explicit_config.as_deref();
         let mut value = toml::Value::try_from(Self::default()).map_err(config_error)?;
+        // Make defaulted admission fields available to nested environment overrides.
+        value["index"].as_table_mut().expect("index table").insert(
+            "resources".into(),
+            toml::Value::try_from(ResourceLimits::default()).map_err(config_error)?,
+        );
         let mut root_selection = None;
         for (path, trusted) in [
             (user_config_path(), true),
@@ -232,59 +243,65 @@ impl Config {
             let Some(path) = path else {
                 continue;
             };
-            match read_config(&path) {
-                Ok(s) => {
-                    let mut overlay = toml::from_str::<toml::Value>(&s).map_err(config_error)?;
-                    if !trusted {
-                        validate_repository_policy(&value, &overlay)?;
-                        if path.canonicalize()?.parent() != Some(root.canonicalize()?.as_path()) {
-                            return Err(Error::new(
-                                "SECURITY_POLICY",
-                                "repository config cannot escape its root via symlink",
-                                8,
-                            ));
-                        }
-                    }
-                    if let Some(field) = overlay
-                        .get_mut("repository")
-                        .and_then(|v| v.get_mut("root"))
-                        && let Some(relative) = field.as_str()
+            let contents = if trusted {
+                match read_config(&path) {
+                    Ok(source) => Some(source),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && explicit != Some(path.as_path()) =>
                     {
-                        if relative.is_empty() {
-                            return Err(config_error("repository.root must be nonempty"));
-                        }
-                        let base = if trusted {
-                            path.parent().unwrap_or(root)
-                        } else {
-                            root
-                        };
-                        let target = base.join(relative).canonicalize()?;
-                        if !target.is_dir()
-                            || (!trusted && !target.starts_with(root.canonicalize()?))
-                        {
-                            return Err(Error::new(
-                                "SECURITY_POLICY",
-                                "repository.root cannot escape the configured root",
-                                8,
-                            ));
-                        }
-                        root_selection = Some(RootSelection {
-                            configured: relative.to_owned(),
-                            resolved: target.clone(),
-                        });
-                        *field = toml::Value::String(
-                            target
-                                .to_str()
-                                .ok_or_else(|| config_error("root must be UTF-8"))?
-                                .into(),
-                        );
+                        None
                     }
-                    merge(&mut value, overlay);
+                    Err(error) => return Err(error.into()),
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        && explicit != Some(path.as_path()) => {}
-                Err(e) => return Err(e.into()),
+            } else {
+                repo_config::read(root)?
+            };
+            if let Some(s) = contents {
+                let mut overlay = toml::from_str::<toml::Value>(&s).map_err(config_error)?;
+                if !trusted {
+                    validate_repository_policy(&value, &overlay)?;
+                    if path.canonicalize()?.parent() != Some(root.canonicalize()?.as_path()) {
+                        return Err(Error::new(
+                            "SECURITY_POLICY",
+                            "repository config cannot escape its root via symlink",
+                            8,
+                        ));
+                    }
+                }
+                if let Some(field) = overlay
+                    .get_mut("repository")
+                    .and_then(|v| v.get_mut("root"))
+                    && let Some(relative) = field.as_str()
+                {
+                    if relative.is_empty() {
+                        return Err(config_error("repository.root must be nonempty"));
+                    }
+                    let base = if trusted {
+                        path.parent().unwrap_or(root)
+                    } else {
+                        root
+                    };
+                    let target = base.join(relative).canonicalize()?;
+                    if !target.is_dir() || (!trusted && !target.starts_with(root.canonicalize()?)) {
+                        return Err(Error::new(
+                            "SECURITY_POLICY",
+                            "repository.root cannot escape the configured root",
+                            8,
+                        ));
+                    }
+                    root_selection = Some(RootSelection {
+                        configured: relative.to_owned(),
+                        resolved: target.clone(),
+                    });
+                    *field = toml::Value::String(
+                        target
+                            .to_str()
+                            .ok_or_else(|| config_error("root must be UTF-8"))?
+                            .into(),
+                    );
+                }
+                merge(&mut value, overlay);
             }
         }
         for (key, raw) in env::vars().filter(|(k, _)| k.starts_with("KORTEX_") && k.contains("__"))
@@ -335,6 +352,7 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        self.index.resources.validate()?;
         if self.repository.root.is_empty() || self.repository.root.contains('\0') {
             return Err(config_error("repository.root must be a nonempty path"));
         }
@@ -405,6 +423,12 @@ impl Config {
         Ok(target)
     }
     pub fn fingerprint(&self) -> Result<String> {
+        // Admission policy never changes semantic facts, including cached parse facts.
+        if !self.index.resources.is_default() {
+            let mut semantic = self.clone();
+            semantic.index.resources = ResourceLimits::default();
+            return semantic.fingerprint();
+        }
         if let Some(selection) = &self.root_selection
             && selection.configured == self.repository.root
         {

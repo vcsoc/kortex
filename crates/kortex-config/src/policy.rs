@@ -23,7 +23,9 @@ pub(crate) fn read_config(path: &Path) -> std::io::Result<String> {
         // lets a same-user replacement FIFO block the config reader forever.
         options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
     }
-    let file = options.open(path)?;
+    read_opened_config(options.open(path)?)
+}
+pub(crate) fn read_opened_config(file: std::fs::File) -> std::io::Result<String> {
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -46,6 +48,23 @@ pub(crate) fn read_config(path: &Path) -> std::io::Result<String> {
     })
 }
 pub(crate) fn validate_repository_policy(base: &toml::Value, overlay: &toml::Value) -> Result<()> {
+    if let Some(resources) = overlay.get("index").and_then(|v| v.get("resources")) {
+        let fields = resources
+            .as_table()
+            .ok_or_else(|| policy("index.resources must be a table"))?;
+        for (name, value) in fields {
+            let cap = base
+                .get("index")
+                .and_then(|v| v.get("resources"))
+                .and_then(|v| v.get(name))
+                .and_then(toml::Value::as_integer);
+            if !matches!((value.as_integer(), cap), (Some(n), Some(cap)) if n > 0 && n <= cap) {
+                return Err(policy(
+                    "repository configuration can only lower inherited resource limits",
+                ));
+            }
+        }
+    }
     // Repository policy may retain or disable a capability, never activate/redirect it.
     for (section, fields) in [
         (

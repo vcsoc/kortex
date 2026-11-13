@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 #[path = "read_projections.rs"]
 mod projections;
 pub(crate) use projections::write_projections;
-pub use projections::{FileDiagnosticPresence, OrderedEdge, OrderedEdgePage, SymbolInventoryEntry};
+pub use projections::{
+    FileDiagnosticPresence, OrderedEdge, OrderedEdgePage, QueryCandidateFilter,
+    QueryCandidateInventory, SymbolInventoryEntry,
+};
 
 /// Exact Snapshot header, not a substitute with missing diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +77,6 @@ pub struct ReadSession<'a> {
     store: &'a Store,
     metadata: SnapshotMetadata,
     source: MetadataSource,
-    projection_source: std::cell::OnceCell<MetadataSource>,
 }
 fn corrupt(e: impl std::fmt::Display) -> Error {
     Error::new("CORRUPT_INDEX", e.to_string(), 6)
@@ -133,7 +135,6 @@ impl Store {
             store: self,
             metadata,
             source,
-            projection_source: std::cell::OnceCell::new(),
         })
     }
 }

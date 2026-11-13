@@ -5,62 +5,75 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+mod bounds;
 mod context;
+pub use bounds::ResolutionLimits;
 mod extended;
 mod lookup;
 use lookup::Lookup;
 mod receivers;
 mod relationships;
 mod rust_modules;
-pub use context::{ResolutionContext, resolve_with_context};
+pub use context::{ResolutionContext, resolve_bounded_with_context, resolve_with_context};
 fn split_type(name: &str) -> (Option<&str>, &str) {
     name.rsplit_once("::")
         .or_else(|| name.rsplit_once('.'))
         .map(|(a, b)| (Some(a), b))
         .unwrap_or((None, name))
 }
+/// Trusted compatibility API without aggregate limits. Use the bounded API for repositories.
 pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
+    resolve_impl(snapshot, go_module, &mut bounds::Budget::new(None))
+        .expect("unbounded resolution has no admission failures")
+}
+fn resolve_impl(
+    snapshot: &Snapshot,
+    go_module: Option<&str>,
+    budget: &mut bounds::Budget<'_>,
+) -> kortex_core::Result<Vec<Edge>> {
     let lookup = Lookup::new(snapshot);
     let snapshot = &lookup;
     let mut edges = Vec::new();
     for file in &snapshot.files {
         for s in &file.symbols {
             if let Some(owner) = &s.owner_id {
-                edges.push(edge(
+                edges.push(budget.edge(
                     snapshot,
                     owner,
                     Some(&s.symbol_id),
                     "DECLARES",
                     s.span.clone(),
                     "exact",
-                    vec![],
+                    &[],
                     "lexical declaration",
-                ));
+                )?);
             }
         }
         for (index, import) in file.imports.iter().enumerate() {
             for target in module_files(snapshot, file, &import.module, go_module) {
                 if let Some(s) = target.symbols.iter().find(|s| s.kind == "file") {
-                    edges.push(edge(
-                        snapshot,
-                        file.symbols
-                            .iter()
-                            .find(|s| s.kind == "file")
-                            .map(|s| s.symbol_id.as_str())
-                            .unwrap_or(""),
-                        Some(&s.symbol_id),
-                        "IMPORTS",
-                        file.import_spans.get(index).cloned().unwrap_or_else(|| {
+                    edges.push(
+                        budget.edge(
+                            snapshot,
                             file.symbols
                                 .iter()
                                 .find(|s| s.kind == "file")
-                                .map(|s| s.span.clone())
-                                .unwrap_or_default()
-                        }),
-                        "exact",
-                        vec![],
-                        &format!("import {}", import.module),
-                    ));
+                                .map(|s| s.symbol_id.as_str())
+                                .unwrap_or(""),
+                            Some(&s.symbol_id),
+                            "IMPORTS",
+                            file.import_spans.get(index).cloned().unwrap_or_else(|| {
+                                file.symbols
+                                    .iter()
+                                    .find(|s| s.kind == "file")
+                                    .map(|s| s.span.clone())
+                                    .unwrap_or_default()
+                            }),
+                            "exact",
+                            &[],
+                            &format!("import {}", import.module),
+                        )?,
+                    );
                 }
             }
         }
@@ -309,7 +322,8 @@ pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
                 candidates.extend(rust_modules::qualified(snapshot, file, reference));
             }
             candidates.retain(|s| accepts(&reference.kind, s));
-            let unique: BTreeSet<_> = candidates.iter().map(|s| s.symbol_id.clone()).collect();
+            let unique: BTreeSet<_> = candidates.iter().map(|s| s.symbol_id.as_str()).collect();
+            budget.memberships(unique.len())?;
             let candidates: Vec<_> = unique.into_iter().collect();
             let uncertain = candidates.iter().any(|id| {
                 snapshot.symbol(id).is_some_and(|s| {
@@ -331,11 +345,11 @@ pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
                 "exact"
             };
             let target = if candidates.len() == 1 && !dynamic_dispatch {
-                Some(candidates[0].as_str())
+                Some(candidates[0])
             } else {
                 None
             };
-            edges.push(edge(
+            edges.push(budget.edge(
                 snapshot,
                 &reference.source_id,
                 target,
@@ -343,9 +357,9 @@ pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
                 reference.span.clone(),
                 resolution,
                 if candidates.len() > 1 || dynamic_dispatch {
-                    candidates.clone()
+                    &candidates
                 } else {
-                    vec![]
+                    &[]
                 },
                 &format!(
                     "{}:{}: {}{}{}{}",
@@ -372,10 +386,10 @@ pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
                         ""
                     }
                 ),
-            ));
+            )?);
         }
     }
-    relationships::complete(snapshot, &mut edges);
+    relationships::complete(snapshot, &mut edges, budget)?;
     // Derive only from original semantic edges; no whole-graph clone is necessary.
     let semantic_count = edges.len();
     for index in 0..semantic_count {
@@ -394,16 +408,18 @@ pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
             _ => None,
         };
         if let Some(kind) = derived {
-            let derived = edge(
+            let candidate_ids: Vec<_> = e.candidates.iter().map(String::as_str).collect();
+            budget.memberships(candidate_ids.len())?;
+            let derived = budget.edge(
                 snapshot,
                 &e.source_id,
                 e.target_id.as_deref(),
                 kind,
                 e.source_span.clone(),
                 &e.resolution,
-                e.candidates.clone(),
+                &candidate_ids,
                 &e.evidence,
-            );
+            )?;
             edges.push(derived);
         }
     }
@@ -414,22 +430,22 @@ pub fn resolve(snapshot: &Snapshot, go_module: Option<&str>) -> Vec<Edge> {
                 .iter()
                 .filter(|s| s.attributes["exported"] == true)
             {
-                edges.push(edge(
+                edges.push(budget.edge(
                     snapshot,
                     &owner.symbol_id,
                     Some(&s.symbol_id),
                     "EXPORTS",
                     s.span.clone(),
                     "exact",
-                    vec![],
+                    &[],
                     "explicit export declaration or CommonJS assignment",
-                ));
+                )?);
             }
         }
     }
     edges.sort_by(|a, b| a.id.cmp(&b.id));
     edges.dedup_by(|a, b| a.id == b.id);
-    edges
+    Ok(edges)
 }
 fn accepts(kind: &str, s: &Symbol) -> bool {
     match kind {

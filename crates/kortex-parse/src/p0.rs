@@ -1,29 +1,29 @@
 //! Additional P0 facts derived from grammar nodes, never source-text pattern matching.
-use super::{span, text};
-use kortex_core::{Import, ParsedFile, Reference};
+use super::{Sink, span, text};
+use kortex_core::{Import, Reference, Result};
 use serde_json::json;
 use tree_sitter::Node;
 
-pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
-    if file.language == "rust" {
-        let indices: Vec<_> = file
-            .import_spans
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| source[s.start_byte..s.end_byte].starts_with("pub use "))
-            .map(|(i, _)| i)
-            .collect();
-        if let Some(s) = file.symbols.iter_mut().find(|s| s.kind == "file") {
-            s.attributes["rust_reexports"] = json!(indices);
+pub(super) fn finish(root: Node<'_>, source: &str, file: &mut Sink) -> Result<()> {
+    if file.language == "rust"
+        && let Some(i) = file.symbols.iter().position(|s| s.kind == "file")
+    {
+        file.attribute(i, "rust_reexports", json!([]))?;
+        for j in 0..file.import_spans.len() {
+            let s = &file.import_spans[j];
+            if source[s.start_byte..s.end_byte].starts_with("pub use ") {
+                file.append_attribute(i, "rust_reexports", json!(j))?;
+            }
         }
     }
     let mut stack = vec![(root, 0usize)];
     while let Some((n, depth)) = stack.pop() {
+        file.checkpoint()?;
         if depth > 256 {
             continue;
         }
         if matches!(file.language.as_str(), "javascript" | "typescript") {
-            commonjs(n, source, file);
+            commonjs(n, source, file)?;
         }
         if file.language == "go"
             && n.kind() == "method_declaration"
@@ -41,38 +41,34 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                     .child_by_field_name("type")
                     .map(|t| text(t, source).trim_start_matches('*'))
                     .unwrap_or("");
-                if let Some(s) = file
-                    .symbols
-                    .iter_mut()
-                    .find(|s| s.attributes["name_start"].as_u64() == Some(name.start_byte() as u64))
-                {
-                    s.attributes["receiver_type"] = json!(ty);
+                if let Some(i) = file.symbols.iter().position(|s| {
+                    s.attributes["name_start"].as_u64() == Some(name.start_byte() as u64)
+                }) {
+                    file.attribute(i, "receiver_type", json!(ty))?;
                 }
             }
         }
         if file.language == "go"
             && matches!(n.kind(), "method_declaration" | "method_elem")
             && let Some(parameters) = n.child_by_field_name("parameters")
+            && let Some(i) = file.symbols.iter().position(|s| {
+                s.span.start_byte == n.start_byte() && s.span.end_byte == n.end_byte()
+            })
         {
-            let mut types = vec![];
+            let result = n
+                .child_by_field_name("result")
+                .map(|n| text(n, source))
+                .unwrap_or("");
+            file.attribute(i, "method_shape", json!([[], result]))?;
             let mut c = parameters.walk();
             for param in parameters.named_children(&mut c) {
                 if let Some(ty) = param.child_by_field_name("type") {
                     let mut c = param.walk();
                     let count = param.children_by_field_name("name", &mut c).count().max(1);
-                    types.extend(std::iter::repeat_n(text(ty, source).to_owned(), count));
+                    for _ in 0..count {
+                        file.append_array_slot(i, "method_shape", 0, json!(text(ty, source)))?;
+                    }
                 }
-            }
-            let result = n
-                .child_by_field_name("result")
-                .map(|n| text(n, source))
-                .unwrap_or("");
-            if let Some(s) = file
-                .symbols
-                .iter_mut()
-                .find(|s| s.span.start_byte == n.start_byte() && s.span.end_byte == n.end_byte())
-            {
-                s.attributes["method_shape"] = json!([types, result]);
             }
         }
         if file.language == "rust"
@@ -82,23 +78,24 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                     .or_else(|| n.child_by_field_name("left")),
                 n.child_by_field_name("bounds"),
             )
+            && let Some(i) = file
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    s.span.start_byte <= n.start_byte() && n.end_byte() <= s.span.end_byte
+                })
+                .min_by_key(|(_, s)| s.span.end_byte - s.span.start_byte)
+                .map(|(i, _)| i)
         {
+            let key = text(name, source);
+            file.nested_attribute(i, Some("trait_bounds"), key, json!([]))?;
             let mut c = bounds.walk();
-            let names: Vec<_> = bounds
+            for name in bounds
                 .named_children(&mut c)
                 .filter(|n| matches!(n.kind(), "type_identifier" | "scoped_type_identifier"))
-                .map(|n| text(n, source))
-                .collect();
-            if let Some(s) = file
-                .symbols
-                .iter_mut()
-                .filter(|s| s.span.start_byte <= n.start_byte() && n.end_byte() <= s.span.end_byte)
-                .min_by_key(|s| s.span.end_byte - s.span.start_byte)
             {
-                if !s.attributes["trait_bounds"].is_object() {
-                    s.attributes["trait_bounds"] = json!({});
-                }
-                s.attributes["trait_bounds"][text(name, source)] = json!(names);
+                file.append_nested_attribute(i, "trait_bounds", key, json!(text(name, source)))?;
             }
         }
         if file.language == "rust" && n.kind().ends_with("_item") {
@@ -109,21 +106,24 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                 previous = attr.prev_named_sibling();
             }
             if conditional {
-                for s in &mut file.symbols {
+                for i in 0..file.symbols.len() {
+                    file.checkpoint()?;
+                    let s = &file.symbols[i];
                     if n.start_byte() <= s.span.start_byte && s.span.end_byte <= n.end_byte() {
-                        s.attributes["conditional"] = json!(true);
+                        file.attribute(i, "conditional", json!(true))?;
                     }
                 }
             }
         }
         if file.language == "rust" && n.kind() == "impl_item" {
             if let Some(ty) = n.child_by_field_name("type") {
-                for s in &mut file.symbols {
+                for i in 0..file.symbols.len() {
+                    let s = &file.symbols[i];
                     if n.start_byte() <= s.span.start_byte
                         && s.span.end_byte <= n.end_byte()
                         && matches!(s.kind.as_str(), "method" | "function")
                     {
-                        s.attributes["receiver_type"] = json!(text(ty, source));
+                        file.attribute(i, "receiver_type", json!(text(ty, source)))?;
                     }
                 }
             }
@@ -138,20 +138,21 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                     .iter()
                     .find(|s| s.name == type_name && s.kind == "struct")
                 {
-                    file.references.push(Reference {
+                    file.reference(Reference {
                         source_id: s.symbol_id.clone(),
                         name: trait_name.into(),
                         qualifier: None,
                         span: span(tr),
                         kind: "IMPLEMENTS".into(),
-                    });
+                    })?;
                 }
-                for s in &mut file.symbols {
+                for i in 0..file.symbols.len() {
+                    let s = &file.symbols[i];
                     if n.start_byte() <= s.span.start_byte
                         && s.span.end_byte <= n.end_byte()
                         && matches!(s.kind.as_str(), "method" | "function")
                     {
-                        s.attributes["implements_trait"] = json!(trait_name);
+                        file.attribute(i, "implements_trait", json!(trait_name))?;
                     }
                 }
             }
@@ -168,13 +169,13 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                 .filter(|s| s.span.start_byte <= n.start_byte() && n.end_byte() <= s.span.end_byte)
                 .min_by_key(|s| s.span.end_byte - s.span.start_byte)
         {
-            file.references.push(Reference {
+            file.reference(Reference {
                 source_id: owner.symbol_id.clone(),
                 name: text(left, source).into(),
                 qualifier: None,
                 span: span(left),
                 kind: "WRITES".into(),
-            });
+            })?;
         }
         if matches!(
             n.kind(),
@@ -204,17 +205,17 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                     )
                 }) {
                     let (q, name) = super::split_name(text(base, source));
-                    file.references.push(Reference {
+                    file.reference(Reference {
                         source_id: owner.clone(),
                         name: name.into(),
                         qualifier: q.map(str::to_owned),
                         span: span(base),
                         kind: kind.into(),
-                    });
+                    })?;
                 }
             }
         }
-        // Only explicit annotation facts are propagated; initializers and dynamic receivers are not guessed.
+        // Only explicit annotations propagate; initializers and dynamic receivers are not guessed.
         if matches!(
             n.kind(),
             "parameter"
@@ -233,16 +234,17 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
                 .trim_start_matches("dyn ")
                 .trim_start_matches("mut ")
                 .trim();
-            let name = n
+            if let Some(name) = n
                 .child_by_field_name("name")
-                .or_else(|| n.child_by_field_name("pattern"));
-            if let Some(name) = name {
-                for s in &mut file.symbols {
+                .or_else(|| n.child_by_field_name("pattern"))
+            {
+                for i in 0..file.symbols.len() {
+                    let s = &file.symbols[i];
                     if name.start_byte() <= s.span.start_byte
                         && s.span.end_byte <= name.end_byte()
                         && s.attributes["binding"] == true
                     {
-                        s.attributes["declared_type"] = json!(ty);
+                        file.attribute(i, "declared_type", json!(ty))?;
                     }
                 }
             }
@@ -252,11 +254,12 @@ pub(super) fn finish(root: Node<'_>, source: &str, file: &mut ParsedFile) {
             stack.push((child, depth + 1));
         }
     }
+    Ok(())
 }
-fn commonjs(n: Node<'_>, source: &str, file: &mut ParsedFile) {
+fn commonjs(n: Node<'_>, source: &str, file: &mut Sink) -> Result<()> {
     if n.kind() == "variable_declarator" {
         let Some(value) = n.child_by_field_name("value") else {
-            return;
+            return Ok(());
         };
         if value.kind() != "call_expression"
             || value
@@ -264,33 +267,32 @@ fn commonjs(n: Node<'_>, source: &str, file: &mut ParsedFile) {
                 .map(|n| text(n, source))
                 != Some("require")
         {
-            return;
+            return Ok(());
         }
         // A locally declared require is not the CommonJS loader.
         if file.symbols.iter().any(|s| s.name == "require") {
-            return;
+            return Ok(());
         }
         let Some(args) = value.child_by_field_name("arguments") else {
-            return;
+            return Ok(());
         };
         if args.named_child_count() != 1 {
-            return;
+            return Ok(());
         }
         let Some(arg) = args.named_child(0).filter(|a| a.kind() == "string") else {
-            return;
+            return Ok(());
         };
         let module = super::unquote(text(arg, source));
         let Some(name) = n.child_by_field_name("name") else {
-            return;
+            return Ok(());
         };
-        let mut bindings = vec![];
         if name.kind() == "identifier" {
-            bindings.push((name, "*".to_owned()));
+            commonjs_binding(file, n, name, source, &module, "*")?;
         } else if name.kind() == "object_pattern" {
             let mut c = name.walk();
             for child in name.named_children(&mut c) {
                 if child.kind() == "shorthand_property_identifier_pattern" {
-                    bindings.push((child, text(child, source).into()));
+                    commonjs_binding(file, n, child, source, &module, text(child, source))?;
                 } else if child.kind() == "pair_pattern"
                     && let (Some(key), Some(value)) = (
                         child.child_by_field_name("key"),
@@ -298,42 +300,25 @@ fn commonjs(n: Node<'_>, source: &str, file: &mut ParsedFile) {
                     )
                     && value.kind() == "identifier"
                 {
-                    bindings.push((value, text(key, source).into()));
+                    commonjs_binding(file, n, value, source, &module, text(key, source))?;
                 }
-            }
-        }
-        for (binding, imported) in bindings {
-            if let Some(s) = file
-                .symbols
-                .iter_mut()
-                .find(|s| s.attributes["name_start"].as_u64() == Some(binding.start_byte() as u64))
-            {
-                s.attributes["import_binding"] = json!(true);
-                file.imports.push(Import {
-                    local: text(binding, source).into(),
-                    module: module.clone(),
-                    imported,
-                });
-                file.import_scopes
-                    .push(s.owner_id.clone().unwrap_or_default());
-                file.import_spans.push(span(n));
             }
         }
     }
     if n.kind() != "assignment_expression" {
-        return;
+        return Ok(());
     }
     let (Some(left), Some(right)) = (
         n.child_by_field_name("left"),
         n.child_by_field_name("right"),
     ) else {
-        return;
+        return Ok(());
     };
     let lhs = text(left, source);
     if file.symbols.iter().any(|s| {
         matches!(s.name.as_str(), "exports" | "module") && s.span.start_byte != n.start_byte()
     }) {
-        return;
+        return Ok(());
     }
     if matches!(right.kind(), "function_expression" | "arrow_function") {
         if let Some(local) = file
@@ -343,19 +328,19 @@ fn commonjs(n: Node<'_>, source: &str, file: &mut ParsedFile) {
             .map(|s| s.name.clone())
         {
             if lhs == "module.exports" {
-                export(file, &local, "default", true);
+                export(file, &local, "default", true)?;
             } else if let Some(name) = lhs
                 .strip_prefix("exports.")
                 .or_else(|| lhs.strip_prefix("module.exports."))
             {
-                export(file, &local, name, false);
+                export(file, &local, name, false)?;
             }
         }
     } else if lhs == "module.exports" && right.kind() == "object" {
         let mut c = right.walk();
         for item in right.named_children(&mut c) {
             if item.kind() == "shorthand_property_identifier" {
-                export(file, text(item, source), text(item, source), false);
+                export(file, text(item, source), text(item, source), false)?;
             } else if item.kind() == "pair"
                 && let (Some(k), Some(v)) = (
                     item.child_by_field_name("key"),
@@ -363,39 +348,64 @@ fn commonjs(n: Node<'_>, source: &str, file: &mut ParsedFile) {
                 )
                 && v.kind() == "identifier"
             {
-                export(file, text(v, source), text(k, source), false);
+                export(file, text(v, source), text(k, source), false)?;
             }
         }
     } else if right.kind() == "identifier" {
         if lhs == "module.exports" {
-            export(file, text(right, source), "default", true);
+            export(file, text(right, source), "default", true)?;
         } else if let Some(name) = lhs
             .strip_prefix("exports.")
             .or_else(|| lhs.strip_prefix("module.exports."))
             && !name.contains('.')
         {
-            export(file, text(right, source), name, false);
+            export(file, text(right, source), name, false)?;
         }
     }
+    Ok(())
 }
-fn export(file: &mut ParsedFile, local: &str, exported: &str, default: bool) {
+fn commonjs_binding(
+    file: &mut Sink,
+    n: Node<'_>,
+    binding: Node<'_>,
+    source: &str,
+    module: &str,
+    imported: &str,
+) -> Result<()> {
+    if let Some(i) = file
+        .symbols
+        .iter()
+        .position(|s| s.attributes["name_start"].as_u64() == Some(binding.start_byte() as u64))
+    {
+        file.attribute(i, "import_binding", json!(true))?;
+        let scope = file.symbols[i].owner_id.clone().unwrap_or_default();
+        file.import(
+            Import {
+                local: text(binding, source).into(),
+                module: module.into(),
+                imported: imported.into(),
+            },
+            scope,
+            span(n),
+        )?;
+    }
+    Ok(())
+}
+fn export(file: &mut Sink, local: &str, exported: &str, default: bool) -> Result<()> {
     let fid = file
         .symbols
         .iter()
         .find(|s| s.kind == "file")
         .map(|s| s.symbol_id.clone())
         .unwrap_or_default();
-    for s in &mut file.symbols {
+    for i in 0..file.symbols.len() {
+        file.checkpoint()?;
+        let s = &file.symbols[i];
         if s.name == local && s.owner_id.as_deref() == Some(&fid) {
-            s.attributes["exported"] = json!(true);
-            s.attributes["default_export"] = json!(default);
-            if !s.attributes["export_names"].is_array() {
-                s.attributes["export_names"] = json!([]);
-            }
-            s.attributes["export_names"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(exported));
+            file.attribute(i, "exported", json!(true))?;
+            file.attribute(i, "default_export", json!(default))?;
+            file.append_attribute(i, "export_names", json!(exported))?;
         }
     }
+    Ok(())
 }

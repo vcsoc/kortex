@@ -11,7 +11,13 @@ notify = { version = "8.2", default-features = false, features = ["macos_kqueue"
 kortex-core.workspace = true
 kortex-config.workspace = true
 ignore.workspace = true
+# Existing locked MIT/Apache regex engine; preserve ignore's byte-selector semantics.
+regex-automata = { version = "=0.4.18", default-features = false, features = ["std", "meta", "syntax"] }
 blake3.workspace = true
+# Maintained RustCrypto (MIT OR Apache-2.0); SHA-1 is only the Git-format checksum.
+sha1 = { version = "=0.11.0", default-features = false }
+# Reuse the existing locked SHA-256 release; no second patch version.
+sha2 = { version = "=0.11.1", default-features = false }
 # Existing audited workspace serde/TOML versions; parse explicit data manifests only.
 serde.workspace = true
 toml.workspace = true

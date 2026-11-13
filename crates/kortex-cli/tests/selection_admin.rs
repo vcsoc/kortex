@@ -35,6 +35,25 @@ fn fixture() -> (tempfile::TempDir, String) {
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     (d, report["repo_id"].as_str().unwrap().to_owned())
 }
+#[cfg(unix)]
+#[test]
+fn repository_config_alias_cannot_echo_outside_dummy_contents() {
+    let parent = support::tempdir().unwrap();
+    let root = parent.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    let outside = parent.path().join("outside.toml");
+    let marker = "OUTSIDE_CLI_CONFIG_DUMMY_MARKER";
+    fs::write(&outside, format!("{marker} = [\"unterminated\n")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(".kortex.toml")).unwrap();
+    let output = command(&root, &["config", "show", "--json"]);
+    assert_eq!(output.status.code(), Some(8));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(marker));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "SECURITY_POLICY");
+    assert!(!root.join(".kortex").exists());
+}
+
 #[test]
 fn registered_config_show_and_path_use_original_explicit_origin_without_opening_index() {
     let (d, id) = fixture();

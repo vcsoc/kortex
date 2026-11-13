@@ -266,6 +266,8 @@ fn missing_legacy_query_projection_falls_back_on_same_store_and_never_guesses_di
              DELETE FROM read_file_diagnostics;
              DELETE FROM read_file_order;
              DELETE FROM generation_read_manifest;
+             DELETE FROM query_symbol_inventory;
+             DELETE FROM generation_query_manifest;
              COMMIT;",
         )
         .unwrap();
@@ -397,6 +399,7 @@ fn actual_cli_query_uses_lazy_dispatch_but_context_keeps_honest_eager_fallback()
         [],
     )
     .unwrap();
+    assert!(db.execute("DELETE FROM read_edge_order", []).unwrap() > 0);
     drop(db);
     let output = std::process::Command::new(&binary)
         .arg("--repo")
@@ -457,6 +460,114 @@ fn top_level_partial_classification_is_unchanged_for_clean_truncated_and_refused
         );
         assert!(!lazy.eager_materialized());
     }
+}
+
+#[test]
+fn exact_unicode_context_and_literal_wildcard_and_nul_errors_match_eager() {
+    let (temp, config) = fixture();
+    std::fs::write(
+        temp.path().join("literal_%_.py"),
+        "def ΟΣ():\n    pass\ndef Σ():\n    pass\n",
+    )
+    .unwrap();
+    kortex_indexer::index_at_root(temp.path(), &config, &Default::default()).unwrap();
+    let eager = Service::open_at_root(temp.path(), config.clone()).unwrap();
+    let lazy = ReadService::open_at_root(temp.path(), config).unwrap();
+    for args in [
+        json!({"text":"ος"}),
+        json!({"text":"οσ"}),
+        json!({"text":"σ"}),
+        json!({"text":"%"}),
+        json!({"text":"_"}),
+        json!({"text":"ΟΣ","path_prefix":"literal_%_"}),
+        json!({"text":"target","path_prefix":"\0"}),
+        json!({"text":"target\0suffix"}),
+        json!({"text":"target"}),
+    ] {
+        compare(&eager, &lazy, &args);
+    }
+    assert!(!lazy.eager_materialized());
+}
+
+#[test]
+fn bounded_retry_page_cache_preserves_filters_offsets_limits_and_current_source_hashes() {
+    let (temp, config) = fixture();
+    let eager = Service::open_at_root(temp.path(), config.clone()).unwrap();
+    let lazy = ReadService::open_at_root(temp.path(), config).unwrap();
+    for args in [
+        json!({"text":"item","limit":20}),
+        json!({"text":"item","limit":7}),
+        json!({"text":"item","limit":1,"max_response_bytes":5000}),
+        json!({"text":"item","limit":30}),
+        json!({"text":"item","limit":3,"cursor":"1"}),
+        json!({"text":"item","limit":2,"cursor":"1"}),
+        json!({"text":"item","limit":7,"language":"rust"}),
+        json!({"text":"item","limit":7,"kind":"method"}),
+        json!({"text":"item","limit":7,"path_prefix":"b"}),
+        json!({"text":"target","limit":20}),
+        json!({"text":"target","limit":1}),
+    ] {
+        compare(&eager, &lazy, &args);
+    }
+    // Same-size edit after cache warmup: every retry still rereads/hashes current source.
+    std::fs::write(temp.path().join("a.py"), "def target():\n    return 2\ndef caller():\n    target()\nclass First:\n    def same(self):\n        pass\n").unwrap();
+    assert_eq!(
+        compare(&eager, &lazy, &json!({"text":"target","limit":1}))["index_status"],
+        "stale"
+    );
+    assert_eq!(
+        compare(
+            &eager,
+            &lazy,
+            &json!({"text":"target","limit":1,"require_fresh":true})
+        )["error"],
+        "STALE_INDEX"
+    );
+    assert!(!lazy.eager_materialized());
+}
+
+#[test]
+fn immutable_cache_is_reader_owned_even_when_a_publication_reuses_generation_id() {
+    let (temp, config) = fixture();
+    let old_eager = Service::open_at_root(temp.path(), config.clone()).unwrap();
+    let old_lazy = ReadService::open_at_root(temp.path(), config.clone()).unwrap();
+    compare(&old_eager, &old_lazy, &json!({"text":"target","limit":20}));
+    let original_generation = old_eager.snapshot.generation_id.clone();
+    let mut replacement = old_eager.snapshot.clone();
+    replacement.generation_id = hash("intermediate-before-generation-id-reuse");
+    let file = replacement
+        .files
+        .iter_mut()
+        .find(|file| file.path == "a.py")
+        .unwrap();
+    file.diagnostics.push("new per-file parser evidence".into());
+    file.symbols
+        .iter_mut()
+        .find(|symbol| symbol.name == "target")
+        .unwrap()
+        .doc_comment = Some("new actual pinned publication fact".into());
+    let mut writer = Store::open(temp.path(), true).unwrap();
+    let lock = writer.writer_lock().unwrap();
+    writer.commit(&replacement, &lock).unwrap();
+    // The intervening publication retired the original primary key. Reusing this
+    // caller-supplied ID is legal, but cannot authorize a cross-reader cache hit.
+    replacement.generation_id = original_generation;
+    writer.commit(&replacement, &lock).unwrap();
+    drop(lock);
+    drop(writer);
+    let new_eager = Service::open_at_root(temp.path(), config.clone()).unwrap();
+    let new_lazy = ReadService::open_at_root(temp.path(), config).unwrap();
+    assert_eq!(
+        new_lazy.metadata().generation_id,
+        old_lazy.metadata().generation_id
+    );
+    let old = compare(&old_eager, &old_lazy, &json!({"text":"target","limit":1}));
+    let new = compare(&new_eager, &new_lazy, &json!({"text":"target","limit":1}));
+    assert_eq!(old["partial"], false);
+    assert_eq!(new["partial"], true);
+    assert_ne!(old["data"]["items"], new["data"]["items"]);
+    assert!(!new_lazy.eager_materialized());
+    assert!(!old_lazy.eager_materialized());
 }
 
 #[test]

@@ -1,6 +1,76 @@
 # Filesystem-security worker: current integration contract
 
+## Parent Follow-Up: Preserve Root Observations, Reuse Initialized Scratch Only
+
+Independent read-only review `4947f01b-1d51-497` found root-check amortization is NOT equivalent to current per-read pathname observations: rename/replacement/restoration across a read can evade endpoint-only checks, and the ambient walker can observe a substituted namespace. Parent REJECTED that relaxation for the existing production path. Every per-file root/parent/leaf check, no-follow descriptor walk, deep-path rewalk and final discovery validation remains unchanged; no new object-only authorization or namespace assurance is claimed.
+
+Parent instead implemented one initialized64KiB scratch allocation per ConfinedReader, reused by the existing bounded read loop. Standalone helpers retain local initialized scratch. Only each actual read's returned prefix is appended, never previous contents; actual EOF/Take(max+1), Interrupted handling, regular/NONBLOCK/NOFOLLOW checks, control checkpoints, text-error precedence and full hashing remain authoritative. No metadata length is used to skip reads. New black-box regressions cover multi-chunk->short->empty, size/binary/UTF8 errors followed by successful reads, and repeated real file growth/shrink at0/1/65535/65536/65537bytes.
+
+Parent native repository tests **76 PASS**, strict native clippy PASS (`target/parent-reusable-read-buffer-{tests,clippy}.log`). Official PINNED1.99.1 Windows-target strict clippy PASS (`target/parent-reusable-read-buffer-windows-pinned-clippy.log`), compile-only; Windows derived storage remains unsupported. Two earlier procedural cross attempts failed due to default-toolchain artifact incompatibility and absent default-toolchain Windows std; logs are preserved (`*-windows-clippy.log`, `*-windows-isolated-clippy.log`). Corrected invocation uses documented explicit1.99.1 PATH/RUSTC and matching target cache, no tool download/test suppression. No timing/speedup/reference acceptance claim has been made for scratch reuse; whole-head validation remains pending concurrent owner completion.
+
 Owned only `crates/kortex-repo/**` and this document. No delegation, commit, reset, clean, push, publication, source/model uploads or listener. Root/source acquisition remains separate from derived-data privacy. Mesh peer messaging is disabled (`agent_mesh_agents`/`agent_mesh_send` report off); this document and native worker report are the parent/transport/storage handoff.
+
+## Current continuation: descriptor-proven discovery, parent acceptance pending
+
+**IMPLEMENTED / 74 native repository tests PASS; not production/platform acceptance.** This continuation changes ONLY `crates/kortex-repo/{src/lib.rs,src/reader.rs,src/reader_tests.rs,examples/freshness_profile.rs}` and this document. The parent Linux experimental stamped-reader correction, original mutation assertion and 64-write regression are untouched and PASS. No metadata-only stamp/mtime/source-byte/hash reuse, dependency/root/lock edit, unsafe, delegation, indexed-code execution, upload/download, listener, commit/push/reset/clean/deploy/publish or platform acceptance action.
+
+### Additive diagnostic API and precise boundary
+
+`kortex_repo::discover_profiled(root: &Path, config: &Config, control: &RequestControl) -> Result<(Inventory, DiscoveryStats)>` is available. Existing `discover`, `discover_with_control`, standalone reads and `ConfinedReader` public APIs remain compatible. `DiscoveryStats` exposes `std::time::Duration` fields `total`, `setup`, `walk`, `canonicalize`, `read`, `hash`; `u64` counters `entry_canonicalizations`, `descriptor_paths`; and `reader: ConfinedReadStats`. Ordinary discovery does NOT call per-entry clocks. Profiled calls use the same implementation/security path, not a relaxed benchmark reader. Errors propagate; no successful stats/inventory pair is returned after an aborted request.
+
+- On **Unix only**, with `follow_symlinks=false` and a regular walk entry, discovery now supplies the original absolute entry spelling to the existing descriptor-relative reader instead of canonicalizing each file. This is only a dedup candidate, NOT accepted path authority. The reader still checks the canonical held root, opens/checks EVERY parent with NOFOLLOW, revalidates cached parent identities from already checked parents, opens a NOFOLLOW/NONBLOCK regular leaf, and repeats parent/leaf/root checks around the real bounded read. A nonsymlink leaf alone proves NOTHING about its parents. Deterministic cold/cached parent substitution to internal AND external symlinks is refused before any new source bytes are read. Post-read leaf/parent/root substitution is refused before publication.
+- No batch-validation boundary was relaxed: root checks still occur around EACH source and once at discovery completion (including empty inventories). The at-most-32-parent FD chain and two bounded-FD deep walks are unchanged. The 35-parent actual discovery regression proves 70 parent opens, two leaf opens and one real four-byte read with no per-entry realpath. All other identity/control/maxbytes/regular-file safeguards remain. No root/parent-check amortization was adopted.
+- `follow_symlinks=true` retains the EXACT canonicalization/inside-root alias policy, canonical-target dedup and original source-path spelling. Windows retains its entire existing resolver path, with no lexical optimization or runtime claim. Normal no-follow walks have no aliases; hardlinks remain distinct path entries just as under canonicalization. Case collision, literal/native UTF-8 path policy, ordering, ignores, manifests, languages, limits, binary and encoding diagnostics retain their existing policies. Raced topology can be refused rather than followed; no atomic filesystem snapshot or arbitrary-ABA/same-UID isolation claim.
+- Initial canonical root/ancestor acquisition remains trusted, distinct from private derived-data `DirectoryAnchor`. Readable shared source remains allowed; no chmod/adoption/ACL stripping. Windows derived-data support remains refused. The new API and counters are not freshness tokens.
+
+Counter/timer meanings: `descriptor_paths` counts lexical regular-entry candidates, including candidates later skipped by language/filter policy; it is NOT a count of security-proved files. `entry_canonicalizations` counts attempted external entry resolutions, separate from the reader's one root canonicalization. `setup` includes override/walker construction and Git tracked-case checks, but not initial source-reader acquisition. `walk` measures iterator advancement (including walker ignore work); `read` includes text conversion and ALL reader opens/validation/reads; `hash` is the actual controlled BLAKE3 pass. Total also includes acquisition, dedup/case/path policies, final root validation and sorting. Reader operation counters are NOT total syscall counts: descriptor fstats, walker/Git operations and capability internals are not exhaustively traced. No privileged syscall tracer was used, and no syscall-reduction claim is inferred from `Read::read` counts.
+
+### Matched actual 10k-file / 100k-function diagnostic
+
+Before editing, ran the unchanged old example twice per flat/nested layout (10 samples each); logs `target/crew-filesystem-before-{flat,nested}-{1,2}.log`. The first flat five old complete-discovery samples were242.498/241.805/255.755/236.475/237.789ms, with69.983/81.925/69.726/72.752/68.097ms in10k canonicalizations. This is the OLD small Rust fixture, NOT a comparison against the larger Python/function fixture below.
+
+The expanded owned example now defaults to at least10 samples, alternates same-security reacquired/shared sessions AND canonicalizing/descriptor discovery, and checks EXACT ordered path/source/hash inventories against the retained canonicalizing branch and generation-time hashes. Every measured discovery asserts real reader bytes, every returned source is independently rehashed, and no generated source is executed. The canonicalizing comparator enables `follow_symlinks` on a fixture containing NO symlinks; its filesystem topology and source contents are identical, but these are diagnostic retained-branch comparisons, not an old-executable causal speedup claim. Unit tests separately retain the exact old canonicalizing discovery + standalone-reader oracle with the SAME supplied config.
+
+Executed final release commands:
+
+```sh
+cargo build -p kortex-repo --release --example freshness_profile --locked --offline
+/usr/bin/time -l target/release/examples/freshness_profile 10000 flat 10 10
+/usr/bin/time -l target/release/examples/freshness_profile 10000 nested 10 10
+```
+
+Both final fixtures have10,000 files /100,000 inert functions /2,950,000 actual source bytes. Flat source/function shape and `filename + NUL + source` framing match the application owner's query profiler EXACTLY: BLAKE3 `3d03be3f05a84b6a4963bf410c12ce055a8a5fac588e88d6815f12cfafa89bf3`, independently computed SHA256 `ee09e1cc2b260ea740ef6760964bb613a5e0b00356a5a5148a65e99ddc18fd91`. Nested100 changes only relative file placement; BLAKE3 `48d793bdbcbf3da60f594ab3856d651e2211aeecf52798dcede3b8c8fd36da6c`, SHA256 `b569b6d502f59374bb4b017a4b1c61297be62f5d088add532fce5f7fb4f4c331`.
+
+Final ten complete-discovery elapsed samples, milliseconds, in execution order:
+
+| Layout / branch | Actual samples |
+| --- | --- |
+| Flat canonicalizing |416.879 /505.069 /428.170 /454.220 /548.283 /663.248 /481.510 /633.526 /624.106 /433.267 |
+| Flat descriptor |306.231 /322.742 /624.944 /293.465 /258.338 /351.962 /421.132 /517.522 /446.643 /481.097 |
+| Nested100 canonicalizing |887.578 /677.153 /694.852 /460.980 /733.555 /725.768 /493.493 /544.288 /359.646 /557.824 |
+| Nested100 descriptor |678.709 /529.251 /511.171 /463.064 /491.486 /362.705 /387.198 /628.471 /371.213 /445.250 |
+
+Final per-stage min-max over those ten samples (milliseconds, NOT percentiles):
+
+| Stage | Flat canonicalizing | Flat descriptor | Nested canonicalizing | Nested descriptor |
+| --- | --- | --- | --- | --- |
+| Setup / Git |6.200-18.301 |6.851-14.464 |5.222-16.205 |5.477-29.495 |
+| Walker |9.105-13.483 |9.050-23.904 |11.477-19.098 |11.304-18.731 |
+| Entry canonicalization |105.373-179.796 |0 |99.805-193.487 |0 |
+| Real read / checks / text |257.511-422.158 |211.990-551.912 |214.194-623.230 |317.896-603.219 |
+| Real BLAKE3 |4.343-6.977 |3.928-10.251 |3.943-34.379 |3.895-8.527 |
+
+Every complete discovery in both branches/layouts reports: one root open/canonicalization,20,001 root checks,10,000 file opens,10,000 leaf checks,20,000 `Read::read` calls,2,950,000 actual bytes. Flat has0 parent opens/checks. Nested100 has100 parent opens and19,900 no-follow parent rechecks. ONLY external entry canonicalizations change10,000 ->0, with10,000 lexical candidates. Full source reads and checks are not reduced. Flat sample resident RSS after each entire run (bytes):21,741,568 /21,250,048 /22,691,840 /21,659,648 /21,725,184 /21,790,720 /22,183,936 /22,675,456 /22,233,088 /22,249,472. Nested:21,970,944 /19,349,504 /19,415,040 /21,610,496 /22,822,912 /19,775,488 /22,282,240 /19,939,328 /22,216,704 /19,464,192. These are actual `ps` resident observations OUTSIDE timers, NOT per-phase peaks. `/usr/bin/time -l` whole-process maxima were22,757,376bytes flat and23,429,120bytes nested, including generation and ALL comparisons/phases.
+
+Logs: `target/crew-filesystem-descriptor-100k-{flat,nested}-rss.log`. A prior ten-sample run BEFORE adding per-run RSS observations is preserved as `target/crew-filesystem-descriptor-100k-{flat,nested}.log`: flat descriptor384.091-1074.921ms /nested526.638-1589.307ms. These slower observations are not discarded. Competing owner builds were active (Cargo actually blocked on shared locks); no quiescent/reference p95, causal percentage/universal speedup, application-query RSS/latency improvement or target acceptance is claimed. The substantive remaining cost is real open/read/root+parent+leaf validation, not resident BLAKE3. Further root/parent-check amortization would need explicit parent boundary review FIRST; no such relaxation was implemented.
+
+Measured final executable SHA256 `e6b0b2cfa7bef90edd47e4e5e7b2be9bd60aab7d327287a083d3ce2882fc09af`; example source SHA256 `19264d783b26d7a70ca63d82f0d25c58db16681295439b6f60b590eebba9d950`; production lib SHA256 `bfb01f951fb926c4cb2291e214f60a5d8e50f1ab925ed986e415162c89e7a80c`; reader source SHA256 `1c4b6bda6afa8e5d30fc7a80364287510258119880ccfd4df70079d890767a5b` (reader change is comment-only).
+
+### Executed scoped checks and residual acceptance
+
+- `cargo test -p kortex-repo --all-features --locked --offline`: **74 PASS**, zero ignored =62 unit +3 input-boundary +1 language-discovery +8 actual Darwin ACL. Original69 preserved, including unchanged Linux correction/assertions. Five new tests prove profiling/plain/oracle equivalence and exact bytes/control, both alias modes/order/hidden/globs/Unicode/binary/invalid UTF-8/file limits, deep uncached discovery, cold/cached regular-leaf parent substitution, and actual post-read discovery swaps/root refusal. Existing tests cover clean/change/new/delete/root+nested ignores/manifests/case/non-UTF8/total limits/FIFO/chunk cancellation/shared source privacy. One new initial expected literal-byte count27 was corrected to its actual28 before the final passing run; no production behavior or original assertion changed. Log `target/crew-filesystem-descriptor-tests.log`.
+- Native ALL-target/ALL-feature locked/offline strict clippy PASS: `target/crew-filesystem-descriptor-clippy.log`. Existing official-toolchain `x86_64-pc-windows-gnu` ALL-target/ALL-feature strict cross-clippy PASS, including test compilation: `target/crew-filesystem-descriptor-windows-clippy.log`. Windows remains compile-only; Linux/current-head runtime remains parent-owned and was NOT rerun here.
+- Owned-only `cargo fmt -p kortex-repo -- --check` and `git diff --check -- crates/kortex-repo docs/crew-filesystem-security.md` PASS. No app/storage edits or duplicated consumer implementation/tests. All requested GitNexus impact reports remain UNINDEXED; direct source/caller/oracle tests substitute, with no graph-completeness claim. Parent independent security/design review, live-head workspace/platform acceptance and quiescent performance gates remain OPEN.
 
 ## Rooted-reader performance continuation: EARLY additive contract
 

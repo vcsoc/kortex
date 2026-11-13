@@ -15,6 +15,19 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+#[path = "read_service_cache_tests.rs"]
+mod cache_tests;
+
+const QUERY_PAGE_CACHE_BYTES: usize = 256 * 1024;
+
+struct QueryPage {
+    key: Value,
+    limit: usize,
+    items: Vec<Value>,
+    more: bool,
+}
+
 pub struct ReadService {
     pub root: PathBuf,
     pub config: Config,
@@ -24,6 +37,11 @@ pub struct ReadService {
     eager: OnceCell<Service>,
     metadata: SnapshotMetadata,
     source: MetadataSource,
+    // These belong to this owned Store's immutable pinned transaction, NEVER a global
+    // generation-ID cache. They die with the reader and retain no second WAL handle.
+    projected_files: OnceCell<Vec<FileInventoryEntry>>,
+    projected_partial: OnceCell<bool>,
+    query_page: RefCell<Option<QueryPage>>,
 }
 impl ReadService {
     pub fn open_selected(selector: Option<&str>, config_path: Option<&Path>) -> Result<Self> {
@@ -66,6 +84,9 @@ impl ReadService {
             eager: OnceCell::new(),
             metadata,
             source,
+            projected_files: OnceCell::new(),
+            projected_partial: OnceCell::new(),
+            query_page: RefCell::new(None),
         })
     }
     pub fn metadata(&self) -> &SnapshotMetadata {
@@ -209,7 +230,7 @@ impl ReadService {
         }
         let freshness = self.with_store(|store| {
             let session = store.read_session()?;
-            if session.read_projection_source()? == MetadataSource::LegacySnapshot {
+            if session.query_scope_source()? == MetadataSource::LegacySnapshot {
                 return Ok(None);
             }
             self.projected_freshness(&session, control).map(Some)
@@ -237,7 +258,15 @@ impl ReadService {
         )? {
             return Ok("stale".into());
         }
-        let files = session.file_inventory_snapshot_order()?;
+        if self.projected_files.get().is_none() {
+            let files = session.query_file_inventory_snapshot_order()?;
+            control.check()?;
+            let _ = self.projected_files.set(files);
+        }
+        let files = self
+            .projected_files
+            .get()
+            .ok_or_else(|| Error::new("INTERNAL_STATE", "pinned file inventory unavailable", 1))?;
         control.check()?;
         execution::freshness_files(
             &self.root,
@@ -279,7 +308,7 @@ impl ReadService {
         let (started, control) = execution::prepare(&context, operation, args, control)?;
         let response = self.with_store(|store| {
             let session = store.read_session()?;
-            if session.read_projection_source()? == MetadataSource::LegacySnapshot { return Ok(None); }
+            if session.query_scope_source()? == MetadataSource::LegacySnapshot { return Ok(None); }
             let freshness = self.projected_freshness(&session, &control)?;
             control.check()?;
             if args.get("require_fresh").and_then(Value::as_bool) == Some(true) && freshness != "fresh" {
@@ -295,15 +324,36 @@ impl ReadService {
                 kind: args.get("kind").and_then(Value::as_str),
                 path_prefix: args.get("path_prefix").and_then(Value::as_str),
             };
-            let (hits, more) = kortex_search::projected::query_projected_with_control(&session, string(args, "text")?, limit, offset, &filters, &control)?;
-            let presence = session.parser_diagnostic_presence()?;
-            control.check()?;
-            let indexed_partial = presence.iter().any(|f| f.has_parser_diagnostics)
-                || self.metadata.diagnostics.iter().any(|s| s.contains("truncated") || s.contains("refused"));
+            let key = json!({"text":string(args, "text")?,"language":filters.language,"kind":filters.kind,"path_prefix":filters.path_prefix,"offset":offset});
+            let cached = self.query_page.borrow();
+            let page = cached.as_ref().filter(|page| page.key == key && limit <= page.limit);
+            let (items, more) = if let Some(page) = page {
+                (page.items.iter().take(limit).cloned().collect::<Vec<_>>(), page.more || page.items.len() > limit)
+            } else {
+                drop(cached);
+                let (hits, more) = kortex_search::projected::query_projected_with_control(&session, string(args, "text")?, limit, offset, &filters, &control)?;
+                let items = match serde_json::to_value(hits)? {
+                    Value::Array(items) => items,
+                    _ => return Err(Error::new("INTERNAL_STATE", "query page is not an array", 1)),
+                };
+                control.check()?;
+                // Bound retained retry data independently of a caller's response budget.
+                let cacheable = serde_json::to_vec(&items)?.len() <= QUERY_PAGE_CACHE_BYTES;
+                *self.query_page.borrow_mut() = cacheable.then(|| QueryPage { key, limit, items:items.clone(), more });
+                (items, more)
+            };
+            if self.projected_partial.get().is_none() {
+                let presence = session.query_parser_diagnostic_presence()?;
+                control.check()?;
+                let partial = presence.iter().any(|f| f.has_parser_diagnostics)
+                    || self.metadata.diagnostics.iter().any(|s| s.contains("truncated") || s.contains("refused"));
+                let _ = self.projected_partial.set(partial);
+            }
+            let indexed_partial = *self.projected_partial.get().ok_or_else(|| Error::new("INTERNAL_STATE", "pinned diagnostic evidence unavailable", 1))?;
             execution::finish(&context, operation, args, execution::ResponseParts {
                 started, freshness, indexed_partial, truncated: false,
                 next_cursor: more.then(|| context.cursor(operation, args, offset + limit)),
-                data: json!({"items":hits}),
+                data: json!({"items":items}),
             }, &control).map(Some)
         })?;
         match response {

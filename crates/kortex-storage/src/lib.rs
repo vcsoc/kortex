@@ -7,11 +7,18 @@ mod publication;
 mod reads;
 pub use reads::{
     FileDiagnosticPresence, FileInventoryEntry, MetadataSource, OrderedEdge, OrderedEdgePage,
-    ReadPage, ReadSession, SnapshotMetadata, SymbolFilter, SymbolInventoryEntry,
+    QueryCandidateFilter, QueryCandidateInventory, ReadPage, ReadSession, SnapshotMetadata,
+    SymbolFilter, SymbolInventoryEntry,
 };
 #[cfg(test)]
 #[path = "placement_tests.rs"]
 mod placement_integration_tests;
+#[cfg(test)]
+mod query_scope_tests;
+#[cfg(test)]
+mod read_cache_tests;
+#[cfg(test)]
+mod read_candidate_tests;
 #[cfg(test)]
 mod read_tests;
 #[cfg(test)]
@@ -50,6 +57,10 @@ fn db_error(e: rusqlite::Error) -> Error {
 }
 pub struct Store {
     conn: Connection,
+    // Successful validation belongs to this immutable read-only transaction, not a request.
+    projection_source: std::cell::OnceCell<MetadataSource>,
+    // Query approval must never authorize full graph evidence.
+    query_projection: std::cell::OnceCell<(MetadataSource, bool)>,
     pub directory: PathBuf,
 }
 pub struct WriterLock {
@@ -143,7 +154,12 @@ impl Store {
         } else {
             conn.execute_batch("BEGIN DEFERRED").map_err(db_error)?;
         }
-        Ok(Self { conn, directory })
+        Ok(Self {
+            conn,
+            projection_source: std::cell::OnceCell::new(),
+            query_projection: std::cell::OnceCell::new(),
+            directory,
+        })
     }
     pub fn writer_lock(&self) -> Result<WriterLock> {
         acquire_writer(&self.directory)

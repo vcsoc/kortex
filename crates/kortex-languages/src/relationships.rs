@@ -2,7 +2,11 @@
 use super::Lookup;
 use kortex_core::Edge;
 use std::collections::BTreeSet;
-pub(super) fn complete(snapshot: &Lookup<'_>, edges: &mut Vec<Edge>) {
+pub(super) fn complete(
+    snapshot: &Lookup<'_>,
+    edges: &mut Vec<Edge>,
+    budget: &mut super::bounds::Budget<'_>,
+) -> kortex_core::Result<()> {
     for e in edges.iter_mut() {
         if e.kind == "INHERITS"
             && e.target_id
@@ -13,16 +17,18 @@ pub(super) fn complete(snapshot: &Lookup<'_>, edges: &mut Vec<Edge>) {
                 .symbol(&e.source_id)
                 .is_some_and(|s| matches!(s.kind.as_str(), "class" | "struct"))
         {
-            *e = super::edge(
+            let candidates: Vec<_> = e.candidates.iter().map(String::as_str).collect();
+            budget.memberships(candidates.len())?;
+            *e = budget.edge(
                 snapshot,
                 &e.source_id,
                 e.target_id.as_deref(),
                 "IMPLEMENTS",
                 e.source_span.clone(),
                 &e.resolution,
-                e.candidates.clone(),
+                &candidates,
                 &e.evidence,
-            );
+            )?;
         }
     }
     for method in snapshot
@@ -50,8 +56,9 @@ pub(super) fn complete(snapshot: &Lookup<'_>, edges: &mut Vec<Edge>) {
                     .as_deref()
                     .is_some_and(|owner| bases.contains(owner))
             })
-            .map(|s| s.symbol_id.clone())
+            .map(|s| s.symbol_id.as_str())
             .collect();
+        budget.memberships(candidates.len())?;
         let candidates: Vec<_> = candidates.into_iter().collect();
         let resolution = match candidates.len() {
             0 => "unresolved",
@@ -59,11 +66,11 @@ pub(super) fn complete(snapshot: &Lookup<'_>, edges: &mut Vec<Edge>) {
             1 => "exact",
             _ => "ambiguous",
         };
-        edges.push(super::edge(
+        edges.push(budget.edge(
             snapshot,
             &method.symbol_id,
             if candidates.len() == 1 {
-                Some(&candidates[0])
+                Some(candidates[0])
             } else {
                 None
             },
@@ -71,11 +78,12 @@ pub(super) fn complete(snapshot: &Lookup<'_>, edges: &mut Vec<Edge>) {
             method.span.clone(),
             resolution,
             if candidates.len() > 1 {
-                candidates.clone()
+                &candidates
             } else {
-                vec![]
+                &[]
             },
             "explicit override marker and declared base-member set",
-        ));
+        )?);
     }
+    Ok(())
 }

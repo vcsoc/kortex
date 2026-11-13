@@ -1,5 +1,22 @@
 //! Optional exact-order and diagnostic evidence, published atomically with schema 1.
 use super::*;
+use kortex_core::RequestControl;
+
+#[path = "query_projections.rs"]
+mod query;
+
+#[cfg(test)]
+#[path = "read_candidate_control_tests.rs"]
+mod control_tests;
+
+fn check_control(control: Option<&RequestControl>) -> Result<()> {
+    control.map_or(Ok(()), RequestControl::check)
+}
+fn candidate_row_checkpoint(control: Option<&RequestControl>) -> Result<()> {
+    #[cfg(test)]
+    control_tests::row_checkpoint();
+    check_control(control)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolInventoryEntry {
@@ -23,6 +40,22 @@ impl SymbolInventoryEntry {
             start_byte: s.span.start_byte,
         }
     }
+}
+/// Case-sensitive literal predicates, applied before ranking (not before the global FTS500).
+#[derive(Debug, Default, Clone)]
+pub struct QueryCandidateFilter<'a> {
+    pub language: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub path_prefix: Option<&'a str>,
+}
+#[derive(Debug, Clone)]
+pub struct QueryCandidateInventory {
+    /// Exact lexical/FTS union after filters, in original Snapshot symbol order.
+    pub items: Vec<SymbolInventoryEntry>,
+    /// Original global FTS500, including entries excluded by the filters.
+    pub fts: Vec<(String, f64)>,
+    /// LegacySnapshot explicitly identifies the existing full same-Store fallback.
+    pub source: MetadataSource,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiagnosticPresence {
@@ -55,10 +88,32 @@ fn integer(value: usize) -> Result<i64> {
 fn unsigned(value: i64) -> Result<usize> {
     usize::try_from(value).map_err(corrupt)
 }
+fn validate_order(
+    conn: &rusqlite::Connection,
+    generation: &str,
+    table: &str,
+    expected: usize,
+) -> Result<()> {
+    // GROUP BY streams the ordinal index. Unlike the combined count(DISTINCT)/min/max
+    // aggregate, it needs no second temporary B-tree and still detects duplicate ordinals.
+    let sql = format!(
+        "SELECT coalesce(sum(n),0),count(*),coalesce(min(ordinal),0),coalesce(max(ordinal),-1),coalesce(max(invalid),0) FROM (SELECT ordinal,count(*) n,typeof(ordinal)<>'integer' invalid FROM {table} WHERE generation_id=?1 GROUP BY ordinal)"
+    );
+    let (rows, distinct, min, max, invalid): (i64, i64, i64, i64, bool) = conn
+        .query_row(&sql, [generation], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .map_err(corrupt)?;
+    let expected = integer(expected)?;
+    if rows != expected || distinct != expected || min != 0 || max != expected - 1 || invalid {
+        return Err(corrupt("incomplete read order projection"));
+    }
+    Ok(())
+}
 impl ReadSession<'_> {
     /// Explicit evidence source for these newer projections, independent of header metadata.
     pub fn read_projection_source(&self) -> Result<MetadataSource> {
-        if let Some(source) = self.projection_source.get() {
+        if let Some(source) = self.store.projection_source.get() {
             return Ok(*source);
         }
         let conn = &self.store.conn;
@@ -103,7 +158,10 @@ impl ReadSession<'_> {
                     }
                 }
             }
-            let _ = self.projection_source.set(MetadataSource::LegacySnapshot);
+            let _ = self
+                .store
+                .projection_source
+                .set(MetadataSource::LegacySnapshot);
             return Ok(MetadataSource::LegacySnapshot);
         };
         let m: Manifest = serde_json::from_str(&raw).map_err(corrupt)?;
@@ -115,36 +173,23 @@ impl ReadSession<'_> {
             return Err(corrupt("read projection manifest mismatch"));
         }
         // Completeness is evidence, not an assumption from the existence of a table.
-        for (sql, count) in [
-            (
-                "SELECT count(*),coalesce(min(ordinal),0),coalesce(max(ordinal),-1),count(DISTINCT ordinal) FROM read_symbol_inventory WHERE generation_id=?1",
-                m.symbols,
-            ),
-            (
-                "SELECT count(*),coalesce(min(ordinal),0),coalesce(max(ordinal),-1),count(DISTINCT ordinal) FROM read_edge_order WHERE generation_id=?1",
-                m.edges,
-            ),
+        for (table, count) in [
+            ("read_symbol_inventory", m.symbols),
+            ("read_edge_order", m.edges),
         ] {
-            let (n, min, max, distinct): (i64, i64, i64, i64) = conn
-                .query_row(sql, [&self.metadata.generation_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })
-                .map_err(corrupt)?;
-            let count = integer(count)?;
-            if n != count || distinct != count || min != 0 || max != count - 1 {
-                return Err(corrupt("incomplete read order projection"));
-            }
+            validate_order(conn, &self.metadata.generation_id, table, count)?;
         }
         let n: i64 = conn.query_row("SELECT count(*) FROM read_file_diagnostics WHERE generation_id=?1 AND typeof(has_diagnostics)='integer' AND has_diagnostics IN(0,1)", [&self.metadata.generation_id], |r| r.get(0)).map_err(corrupt)?;
         if n != integer(m.files)? {
             return Err(corrupt("incomplete parser diagnostic evidence"));
         }
         if m.version == 2 {
-            let (n,min,max,distinct): (i64,i64,i64,i64) = conn.query_row("SELECT count(*),coalesce(min(ordinal),0),coalesce(max(ordinal),-1),count(DISTINCT ordinal) FROM read_file_order WHERE generation_id=?1", [&self.metadata.generation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(corrupt)?;
-            let count = integer(m.files)?;
-            if n != count || min != 0 || max != count - 1 || distinct != count {
-                return Err(corrupt("incomplete file order evidence"));
-            }
+            validate_order(
+                conn,
+                &self.metadata.generation_id,
+                "read_file_order",
+                m.files,
+            )?;
             let broken: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM read_file_order p LEFT JOIN files f ON f.id=p.id AND f.generation_id=p.generation_id WHERE p.generation_id=?1 AND f.id IS NULL)", [&self.metadata.generation_id], |r|r.get(0)).map_err(corrupt)?;
             if broken {
                 return Err(corrupt("file order identity mismatch"));
@@ -162,7 +207,7 @@ impl ReadSession<'_> {
         } else {
             MetadataSource::LegacySnapshot
         };
-        let _ = self.projection_source.set(source);
+        let _ = self.store.projection_source.set(source);
         Ok(source)
     }
     /// O(symbols) lightweight rows in Snapshot order. Apply Rust Unicode lexical semantics
@@ -204,10 +249,133 @@ impl ReadSession<'_> {
         })
         .collect()
     }
+    /// Streams all lightweight columns but allocates only exact lexical/FTS candidates.
+    /// Rust Unicode lowercase is evaluated on actual UTF-8 strings, never SQL lower/LIKE.
+    /// Legacy projections retain the explicit same-Store inventory/full fallback.
+    pub fn query_candidate_inventory(
+        &self,
+        text: &str,
+        filter: &QueryCandidateFilter<'_>,
+    ) -> Result<QueryCandidateInventory> {
+        self.query_candidate_inventory_inner(text, filter, None, false)
+    }
+    /// Same exact inventory with the caller's cooperative cancellation/deadline.
+    /// Each row/filter step checks control; one SQLite step, legacy load, or individual
+    /// Unicode lowercase operation remains indivisible (no hard preemption claim).
+    pub fn query_candidate_inventory_with_control(
+        &self,
+        text: &str,
+        filter: &QueryCandidateFilter<'_>,
+        control: &RequestControl,
+    ) -> Result<QueryCandidateInventory> {
+        self.query_candidate_inventory_inner(text, filter, Some(control), false)
+    }
+    pub(super) fn query_candidate_inventory_inner(
+        &self,
+        text: &str,
+        filter: &QueryCandidateFilter<'_>,
+        control: Option<&RequestControl>,
+        query_scope: bool,
+    ) -> Result<QueryCandidateInventory> {
+        check_control(control)?;
+        if text.len() > 4096 || text.trim().is_empty() {
+            return Err(Error::new("QUERY_LIMIT", "query 1..4096 bytes required", 2));
+        }
+        let (source, fast) = if query_scope {
+            self.query_projection()?
+        } else {
+            (self.read_projection_source()?, false)
+        };
+        check_control(control)?;
+        let fts = self.keyword(text, 500)?;
+        check_control(control)?;
+        let needed: std::collections::BTreeSet<_> = fts.iter().map(|(id, _)| id.as_str()).collect();
+        let lower = text.to_lowercase();
+        let matches =
+            |id: &str, name: &str, qualified: &str, path: &str, language: &str, kind: &str| {
+                filter.language.is_none_or(|v| language == v)
+                    && filter.kind.is_none_or(|v| kind == v)
+                    && filter.path_prefix.is_none_or(|v| path.starts_with(v))
+                    && (needed.contains(id)
+                        || name == text
+                        || qualified == text
+                        || name.to_lowercase().starts_with(&lower)
+                        || qualified.to_lowercase().contains(&lower)
+                        || path.to_lowercase().contains(&lower))
+            };
+        let items = if source == MetadataSource::LegacySnapshot {
+            let inventory = if query_scope {
+                self.load()?
+                    .symbols()
+                    .map(SymbolInventoryEntry::from_symbol)
+                    .collect()
+            } else {
+                self.symbol_inventory()?
+            };
+            check_control(control)?;
+            let mut items = Vec::new();
+            for s in inventory {
+                candidate_row_checkpoint(control)?;
+                if matches(
+                    &s.symbol_id,
+                    &s.name,
+                    &s.qualified_name,
+                    &s.file_path,
+                    &s.language,
+                    &s.kind,
+                ) {
+                    items.push(s);
+                }
+            }
+            items
+        } else {
+            let sql = if fast {
+                "SELECT id,name,qualified_name,file_path,language,kind,start_byte FROM query_symbol_inventory WHERE generation_id=?1 ORDER BY ordinal"
+            } else {
+                "SELECT n.id,n.name,n.qualified_name,n.file_path,p.language,n.kind,p.start_byte FROM read_symbol_inventory p JOIN nodes n ON n.id=p.id AND n.generation_id=p.generation_id WHERE p.generation_id=?1 ORDER BY p.ordinal"
+            };
+            let mut stmt = self.store.conn.prepare(sql).map_err(corrupt)?;
+            let mut rows = stmt
+                .query([&self.metadata.generation_id])
+                .map_err(corrupt)?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next().map_err(corrupt)? {
+                candidate_row_checkpoint(control)?;
+                // Validate even excluded rows: malformed UTF-8/types must not be hidden by filters.
+                let id = row.get_ref(0).map_err(corrupt)?.as_str().map_err(corrupt)?;
+                let name = row.get_ref(1).map_err(corrupt)?.as_str().map_err(corrupt)?;
+                let qualified = row.get_ref(2).map_err(corrupt)?.as_str().map_err(corrupt)?;
+                let path = row.get_ref(3).map_err(corrupt)?.as_str().map_err(corrupt)?;
+                let language = row.get_ref(4).map_err(corrupt)?.as_str().map_err(corrupt)?;
+                let kind = row.get_ref(5).map_err(corrupt)?.as_str().map_err(corrupt)?;
+                let start_byte = unsigned(row.get(6).map_err(corrupt)?)?;
+                if matches(id, name, qualified, path, language, kind) {
+                    items.push(SymbolInventoryEntry {
+                        symbol_id: id.into(),
+                        name: name.into(),
+                        qualified_name: qualified.into(),
+                        file_path: path.into(),
+                        language: language.into(),
+                        kind: kind.into(),
+                        start_byte,
+                    });
+                }
+            }
+            items
+        };
+        check_control(control)?;
+        Ok(QueryCandidateInventory { items, fts, source })
+    }
     /// O(files), exact original Snapshot file-vector order, without ParsedFile JSON.
     /// Check read_projection_source first when full legacy materialization is undesirable.
     pub fn file_inventory_snapshot_order(&self) -> Result<Vec<FileInventoryEntry>> {
-        if self.read_projection_source()? == MetadataSource::LegacySnapshot {
+        self.file_inventory_for_source(self.read_projection_source()?)
+    }
+    pub(super) fn file_inventory_for_source(
+        &self,
+        source: MetadataSource,
+    ) -> Result<Vec<FileInventoryEntry>> {
+        if source == MetadataSource::LegacySnapshot {
             let snapshot = self.load()?;
             return Ok(snapshot
                 .files
@@ -246,7 +414,13 @@ impl ReadSession<'_> {
     }
     /// Every file has explicit true/false evidence; absence of top-level diagnostics is irrelevant.
     pub fn parser_diagnostic_presence(&self) -> Result<Vec<FileDiagnosticPresence>> {
-        if self.read_projection_source()? == MetadataSource::LegacySnapshot {
+        self.diagnostics_for_source(self.read_projection_source()?)
+    }
+    pub(super) fn diagnostics_for_source(
+        &self,
+        source: MetadataSource,
+    ) -> Result<Vec<FileDiagnosticPresence>> {
+        if source == MetadataSource::LegacySnapshot {
             let snapshot = self.load()?;
             let mut rows: Vec<_> = snapshot
                 .files
@@ -414,5 +588,6 @@ CREATE TABLE IF NOT EXISTS read_file_order(generation_id TEXT NOT NULL,id TEXT N
         ],
     )
     .map_err(db_error)?;
+    query::write_query_projections(tx, s)?;
     Ok(())
 }

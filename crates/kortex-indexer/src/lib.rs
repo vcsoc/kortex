@@ -1,4 +1,5 @@
 //! Full/incremental indexing with cached facts and atomic generation publication.
+mod resources;
 use kortex_config::Config;
 use kortex_core::{Error, PARSER_VERSION, Result, Snapshot, id, public_path};
 use kortex_storage::Store;
@@ -83,9 +84,17 @@ pub fn index_at_root(path: &Path, config: &Config, options: &Options) -> Result<
         config.index.workers.min(cpus).max(1)
     };
     let pool = rayon::ThreadPoolBuilder::new()
+        // Recursive emitters run only after AST depth admission, on a declared stack.
+        .stack_size(8 * 1024 * 1024)
         .num_threads(workers)
         .build()
         .map_err(|e| Error::new("WORKER_POOL", e.to_string(), 1))?;
+    let admission = resources::Admission::new(&config.index.resources);
+    let output_limits = admission.output_limits();
+    let parse_limits = kortex_parse::ParseLimits {
+        max_ast_nodes: config.index.resources.max_file_ast_nodes,
+        max_ast_depth: config.index.resources.max_file_ast_depth,
+    };
     let facts: Vec<_> = pool.install(|| {
         inventory
             .files
@@ -95,18 +104,20 @@ pub fn index_at_root(path: &Path, config: &Config, options: &Options) -> Result<
                     .get(file.path.as_str())
                     .filter(|f| f.content_hash == file.content_hash)
                 {
+                    admission.admit(f)?;
                     return Ok(((*f).clone(), true));
                 }
-                Ok((
-                    kortex_parse::parse(
-                        &repo_id,
-                        &file.path,
-                        kortex_repo::language(&file.path)
-                            .ok_or_else(|| Error::new("UNSUPPORTED_LANGUAGE", &file.path, 7))?,
-                        &file.source,
-                    )?,
-                    false,
-                ))
+                let parsed = kortex_parse::parse_bounded_with_output_limits(
+                    &repo_id,
+                    &file.path,
+                    kortex_repo::language(&file.path)
+                        .ok_or_else(|| Error::new("UNSUPPORTED_LANGUAGE", &file.path, 7))?,
+                    &file.source,
+                    &parse_limits,
+                    &output_limits,
+                )?;
+                admission.admit(&parsed)?;
+                Ok((parsed, false))
             })
             .collect::<Result<Vec<_>>>()
     })?;
@@ -156,7 +167,18 @@ pub fn index_at_root(path: &Path, config: &Config, options: &Options) -> Result<
     }
     // Safe fallback: cached immutable parse facts are reused, but ALL resolution is rebuilt.
     // No dependent graph is retained, so manifest/import/export edits cannot leave stale edges.
-    snapshot.edges = kortex_languages::resolve_with_context(&snapshot, &context);
+    let limits = &config.index.resources;
+    snapshot.edges = kortex_languages::resolve_bounded_with_context(
+        &snapshot,
+        &context,
+        &kortex_languages::ResolutionLimits {
+            max_edges: limits.max_edges,
+            max_candidate_memberships: limits.max_candidate_memberships,
+            max_edge_bytes: limits.max_edge_bytes,
+            max_imports: limits.max_imports,
+            max_fact_bytes: limits.max_parsed_bytes,
+        },
+    )?;
     if options.verify {
         let fresh = kortex_repo::discover(&root, config)?;
         let before: Vec<_> = snapshot

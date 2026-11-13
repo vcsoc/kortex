@@ -1,12 +1,20 @@
 //! Confined repository discovery and read-only Git inspection.
 mod confined;
+mod policy;
 mod reader;
+pub use policy::{
+    AuthorizedPolicy, PolicyAncestor, PolicyCategory, PolicyContext, PolicyEvidence, PolicyInputs,
+    PolicyProvenance, PolicyRepository, discover_authorized_profiled,
+    discover_authorized_with_control,
+};
 #[cfg(test)]
 mod reader_tests;
 pub use reader::{ConfinedReadStats, ConfinedReader};
 pub mod experimental;
+pub mod git_index;
 pub mod inputs;
 pub mod placement;
+pub mod policy_authority;
 pub mod watch;
 pub mod workspace;
 use kortex_config::Config;
@@ -176,8 +184,23 @@ pub fn read_confined_with_control(
     String::from_utf8(bytes).map_err(|_| Error::new("INVALID_ENCODING", "not UTF-8", 7))
 }
 
+/// Opt-in discovery diagnostics. Durations include instrumentation overhead;
+/// counters are reader operations, not a kernel syscall trace.
+#[derive(Debug, Default)]
+pub struct DiscoveryStats {
+    pub total: std::time::Duration,
+    pub setup: std::time::Duration,
+    pub walk: std::time::Duration,
+    pub canonicalize: std::time::Duration,
+    pub read: std::time::Duration,
+    pub hash: std::time::Duration,
+    pub entry_canonicalizations: u64,
+    pub descriptor_paths: u64,
+    pub reader: ConfinedReadStats,
+}
+
 pub fn discover(root: &Path, config: &Config) -> Result<Inventory> {
-    discover_impl(root, config, None)
+    discover_impl(root, config, None, None)
 }
 
 /// Cancellation/timeout aborts the inventory, never becomes a skipped-file diagnostic.
@@ -186,23 +209,48 @@ pub fn discover_with_control(
     config: &Config,
     control: &RequestControl,
 ) -> Result<Inventory> {
-    discover_impl(root, config, Some(control))
+    discover_impl(root, config, Some(control), None)
+}
+
+/// Same discovery/security policy with opt-in stage timings and actual read counters.
+/// All accepted bytes are read and hashed anew; no names or source enter the stats.
+pub fn discover_profiled(
+    root: &Path,
+    config: &Config,
+    control: &RequestControl,
+) -> Result<(Inventory, DiscoveryStats)> {
+    let start = std::time::Instant::now();
+    let mut stats = DiscoveryStats::default();
+    let inventory = discover_impl(root, config, Some(control), Some(&mut stats))?;
+    stats.total = start.elapsed();
+    Ok((inventory, stats))
 }
 
 fn discover_impl(
     root: &Path,
     config: &Config,
     control: Option<&RequestControl>,
+    mut stats: Option<&mut DiscoveryStats>,
 ) -> Result<Inventory> {
     checkpoint(control)?;
     let mut reader = ConfinedReader::new(root)?;
-    let inventory = discover_using(root, config, control, |canonical, _path| {
-        reader
-            .read_resolved(canonical, config.repository.max_file_size_bytes, control)
-            .and_then(reader::text)
-    })?;
+    let inventory = discover_using(
+        root,
+        config,
+        control,
+        false,
+        stats.as_deref_mut(),
+        |canonical, _path| {
+            reader
+                .read_resolved(canonical, config.repository.max_file_size_bytes, control)
+                .and_then(reader::text)
+        },
+    )?;
     // Also bind an empty/unsupported-only inventory to the acquired root.
     reader.validate(control)?;
+    if let Some(stats) = stats {
+        stats.reader = reader.stats().clone();
+    }
     Ok(inventory)
 }
 
@@ -210,8 +258,11 @@ fn discover_using(
     root: &Path,
     config: &Config,
     control: Option<&RequestControl>,
-    mut read: impl FnMut(&Path, &str) -> Result<String>,
+    canonicalize_entries: bool,
+    mut stats: Option<&mut DiscoveryStats>,
+    read: impl FnMut(&Path, &str) -> Result<String>,
 ) -> Result<Inventory> {
+    let setup_start = stats.as_ref().map(|_| std::time::Instant::now());
     checkpoint(control)?;
     let mut overrides = ignore::overrides::OverrideBuilder::new(root);
     for pattern in &config.repository.include {
@@ -256,6 +307,45 @@ fn discover_using(
             .any(|n| e.file_name() == *n)
         });
     builder.sort_by_file_name(|a, b| a.cmp(b));
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.setup = setup_start.unwrap().elapsed();
+    }
+    discover_prepared(
+        root,
+        config,
+        control,
+        stats,
+        DiscoveryWalk {
+            builder,
+            canonicalize_entries,
+            inspect_git: true,
+        },
+        read,
+        || Ok(()),
+    )
+}
+
+struct DiscoveryWalk {
+    builder: ignore::WalkBuilder,
+    canonicalize_entries: bool,
+    inspect_git: bool,
+}
+
+fn discover_prepared(
+    root: &Path,
+    config: &Config,
+    control: Option<&RequestControl>,
+    mut stats: Option<&mut DiscoveryStats>,
+    prepared: DiscoveryWalk,
+    mut read: impl FnMut(&Path, &str) -> Result<String>,
+    mut pending: impl FnMut() -> Result<()>,
+) -> Result<Inventory> {
+    let DiscoveryWalk {
+        builder,
+        canonicalize_entries,
+        inspect_git,
+    } = prepared;
+    let setup_start = stats.as_ref().map(|_| std::time::Instant::now());
     let mut total_bytes = 0u64;
     let mut inventory = Inventory {
         files: vec![],
@@ -265,7 +355,7 @@ fn discover_using(
     let mut case_paths = std::collections::BTreeMap::<String, String>::new();
     // A case-insensitive checkout cannot hold both spellings, but Git's index can.
     // Inspect names only; ls-files never runs clean filters or repository code.
-    if let Ok(tracked) = git_impl(root, &["ls-files", "--cached", "-z"], control) {
+    if inspect_git && let Ok(tracked) = git_impl(root, &["ls-files", "--cached", "-z"], control) {
         for path in tracked.split('\0').filter(|path| !path.is_empty()) {
             checkpoint(control)?;
             if let Some(previous) = case_paths.insert(path.to_lowercase(), path.to_owned())
@@ -283,8 +373,21 @@ fn discover_using(
     // Detect collisions within each inventory, not between old Git names and current files.
     case_paths.clear();
     let mut considered = 0;
-    for entry in builder.build() {
+    let mut walk = builder.build();
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.setup += setup_start.unwrap().elapsed();
+    }
+    loop {
         checkpoint(control)?;
+        let start = stats.as_ref().map(|_| std::time::Instant::now());
+        let entry = walk.next();
+        // A filter callback may fail while next() skips the last entry and
+        // returns None. Never publish a partial inventory (or stats) then.
+        pending()?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.walk += start.unwrap().elapsed();
+        }
+        let Some(entry) = entry else { break };
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -308,13 +411,34 @@ fn discover_using(
                 .push("max_files reached; inventory truncated".into());
             break;
         }
-        let canonical = match entry.path().canonicalize() {
-            Ok(p) if p.starts_with(root) => p,
-            _ => {
-                inventory
-                    .diagnostics
-                    .push(format!("{}: path refused", entry.path().display()));
-                continue;
+        // This walk never follows links in this mode. The lexical spelling is
+        // only a dedup candidate: read_resolved still proves EVERY component
+        // descriptor-relatively with NOFOLLOW, including cached-parent rechecks.
+        // A regular leaf alone is not evidence that its parents are safe.
+        let descriptor_path = cfg!(unix)
+            && !canonicalize_entries
+            && !config.repository.follow_symlinks
+            && entry.file_type().is_some_and(|t| t.is_file());
+        let canonical = if descriptor_path {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.descriptor_paths += 1;
+            }
+            entry.path().to_owned()
+        } else {
+            let start = stats.as_ref().map(|_| std::time::Instant::now());
+            let resolved = entry.path().canonicalize();
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.entry_canonicalizations += 1;
+                stats.canonicalize += start.unwrap().elapsed();
+            }
+            match resolved {
+                Ok(p) if p.starts_with(root) => p,
+                _ => {
+                    inventory
+                        .diagnostics
+                        .push(format!("{}: path refused", entry.path().display()));
+                    continue;
+                }
             }
         };
         let relative = entry
@@ -355,7 +479,11 @@ fn discover_using(
         if !seen.insert(canonical.clone()) {
             continue;
         }
+        let start = stats.as_ref().map(|_| std::time::Instant::now());
         let read = read(&canonical, &path);
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.read += start.unwrap().elapsed();
+        }
         checkpoint(control)?;
         match read {
             Ok(source) => {
@@ -367,7 +495,11 @@ fn discover_using(
                     break;
                 }
                 checkpoint(control)?;
+                let start = stats.as_ref().map(|_| std::time::Instant::now());
                 let content_hash = hash_controlled(source.as_bytes(), control)?;
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.hash += start.unwrap().elapsed();
+                }
                 checkpoint(control)?;
                 inventory.files.push(SourceFile {
                     path,
@@ -378,6 +510,7 @@ fn discover_using(
             Err(e) => inventory.diagnostics.push(format!("{path}: {e}")),
         }
     }
+    pending()?;
     checkpoint(control)?;
     inventory.files.sort_by(|a, b| a.path.cmp(&b.path));
     inventory.diagnostics.sort();

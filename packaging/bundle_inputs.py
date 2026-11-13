@@ -74,7 +74,7 @@ def collect_web_assets(directory):
     return files
 
 
-def collect_notices(metadata, project, include_frontend=False):
+def collect_notices(metadata, project, include_frontend=False, frontend_root=None):
     files = {}
     members = set(metadata["workspace_members"])
     active = {(package["name"], package["version"]): package for package in metadata["packages"]}
@@ -108,6 +108,16 @@ def collect_notices(metadata, project, include_frontend=False):
             raise ValueError("conflicting third-party notices require review")
         files[key] = content
     lock_path = project / "web/package-lock.json"
+    web_root = project / "web"
+    if frontend_root is not None:
+        supplied = Path(frontend_root)
+        if not include_frontend or supplied.is_symlink() or not supplied.is_dir():
+            raise ValueError("external frontend requires a regular installed dependency directory")
+        web_root = supplied.resolve(strict=True)
+        # An external offline install must describe exactly the frozen frontend.
+        for name in ("package.json", "package-lock.json"):
+            if bounded_regular_bytes(web_root / name, 8 * 1024 * 1024) != bounded_regular_bytes(project / "web" / name, 8 * 1024 * 1024):
+                raise ValueError("external frontend manifest/lock differs from frozen source")
     if include_frontend and lock_path.exists():
         lock = json.loads(bounded_regular_bytes(lock_path, 8 * 1024 * 1024))
         for key, package in sorted(lock["packages"].items()):
@@ -116,12 +126,12 @@ def collect_notices(metadata, project, include_frontend=False):
             relative = PurePosixPath(key)
             if relative.is_absolute() or ".." in relative.parts or "\\" in key or package.get("link"):
                 raise ValueError("unsafe or linked npm notice location")
-            root = project / "web" / Path(*relative.parts)
+            root = web_root / Path(*relative.parts)
             if not root.exists():
                 if package.get("optional"):
                     continue  # Other-platform build tools are inventoried, not asserted installed/bundled.
                 raise ValueError("install locked frontend dependencies before bundling notices")
-            if root.is_symlink() or not root.resolve().is_relative_to((project / "web").resolve()):
+            if root.is_symlink() or not root.resolve().is_relative_to(web_root.resolve()):
                 raise ValueError("npm notice directory escapes frontend")
             name = urllib.parse.quote(package.get("name") or key.rsplit("node_modules/", 1)[-1], safe="")
             version = urllib.parse.quote(package["version"], safe="")

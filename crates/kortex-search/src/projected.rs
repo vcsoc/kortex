@@ -1,8 +1,11 @@
 //! Exact lexical/FTS ranking over lightweight pinned inventory; eager search is retained.
 use crate::{Filters, Hit, sort_with_control};
 use kortex_core::{Error, RequestControl, Result};
-use kortex_storage::{ReadSession, SymbolInventoryEntry};
-use std::collections::{BTreeMap, BTreeSet};
+use kortex_storage::{QueryCandidateFilter, ReadSession, SymbolInventoryEntry};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+};
 #[cfg(test)]
 #[path = "projected_tests.rs"]
 mod tests;
@@ -15,7 +18,78 @@ fn matches(filters: &Filters<'_>, symbol: &SymbolInventoryEntry) -> bool {
             .is_none_or(|s| symbol.file_path.starts_with(s))
 }
 
-/// O(symbols) lightweight ranking, with only the requested page decoded as full Symbols.
+#[derive(Clone, Copy)]
+struct Ranked<'a> {
+    entry: &'a SymbolInventoryEntry,
+    score: f64,
+    lexical: Option<&'static str>,
+    fts_count: usize,
+}
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Ranked<'_> {}
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then(self.entry.file_path.cmp(&other.entry.file_path))
+            .then(self.entry.start_byte.cmp(&other.entry.start_byte))
+            .then(self.entry.symbol_id.cmp(&other.entry.symbol_id))
+    }
+}
+
+fn lower_prefix(value: &str, lower: &str) -> bool {
+    if value.is_ascii() && lower.is_ascii() {
+        value
+            .as_bytes()
+            .get(..lower.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(lower.as_bytes()))
+    } else {
+        value.to_lowercase().starts_with(lower)
+    }
+}
+fn lower_contains(value: &str, lower: &str) -> bool {
+    if value.is_ascii() && lower.is_ascii() {
+        lower.is_empty()
+            || value
+                .as_bytes()
+                .windows(lower.len())
+                .any(|part| part.eq_ignore_ascii_case(lower.as_bytes()))
+    } else {
+        // str::to_lowercase includes contextual Unicode rules (e.g. final sigma).
+        value.to_lowercase().contains(lower)
+    }
+}
+fn lexical_score(
+    entry: &SymbolInventoryEntry,
+    text: &str,
+    lower: &str,
+) -> Option<(f64, &'static str)> {
+    if entry.name == text {
+        Some((1000., "exact_symbol"))
+    } else if entry.qualified_name == text {
+        Some((950., "qualified_name"))
+    } else if lower_prefix(&entry.name, lower) {
+        Some((700., "prefix"))
+    } else if lower_contains(&entry.qualified_name, lower) {
+        Some((500., "qualified_substring"))
+    } else if lower_contains(&entry.file_path, lower) {
+        Some((300., "path"))
+    } else {
+        None
+    }
+}
+
+/// Lightweight ranking retains only offset+limit entries, decoding only the returned page.
 /// The caller must choose an explicit same-Store eager fallback for legacy projections.
 pub fn query_projected_with_control(
     session: &ReadSession<'_>,
@@ -33,71 +107,63 @@ pub fn query_projected_with_control(
             2,
         ));
     }
-    let inventory = session.symbol_inventory()?;
-    control.check()?;
-    let mut ranked: BTreeMap<&str, (&SymbolInventoryEntry, f64, Vec<String>)> = BTreeMap::new();
-    let lower = text.to_lowercase();
-    for s in &inventory {
-        control.check()?;
-        if !matches(filters, s) {
-            continue;
-        }
-        // Deliberately Rust Unicode lowercase, not SQLite's ASCII-only lower/LIKE.
-        let (score, why) = if s.name == text {
-            (1000., "exact_symbol")
-        } else if s.qualified_name == text {
-            (950., "qualified_name")
-        } else if s.name.to_lowercase().starts_with(&lower) {
-            (700., "prefix")
-        } else if s.qualified_name.to_lowercase().contains(&lower) {
-            (500., "qualified_substring")
-        } else if s.file_path.to_lowercase().contains(&lower) {
-            (300., "path")
-        } else {
-            continue;
-        };
-        ranked.insert(&s.symbol_id, (s, score, vec![why.into()]));
-    }
-    control.check()?;
-    // Preserve the original global 500-candidate FTS cap BEFORE application filters.
-    let fts = session.keyword(text, 500)?;
-    control.check()?;
-    let needed: BTreeSet<_> = fts.iter().map(|(id, _)| id.as_str()).collect();
-    let mut fts_symbols = BTreeMap::new();
-    for symbol in &inventory {
-        control.check()?;
-        if needed.contains(symbol.symbol_id.as_str()) {
-            fts_symbols
-                .entry(symbol.symbol_id.as_str())
-                .or_insert(symbol);
-        }
-    }
-    for (id, score) in &fts {
-        control.check()?;
-        if let Some((_, _, why)) = ranked.get_mut(id.as_str()) {
-            why.push("fts5_bm25".into());
-        } else if let Some(s) = fts_symbols.get(id.as_str()).filter(|s| matches(filters, s)) {
-            ranked.insert(
-                s.symbol_id.as_str(),
-                (*s, 100. + (-score).min(99.), vec!["fts5_bm25".into()]),
-            );
-        }
-    }
-    let mut hits: Vec<_> = ranked.into_values().collect();
-    sort_with_control(
-        &mut hits,
-        |a, b| {
-            b.1.total_cmp(&a.1)
-                .then(a.0.file_path.cmp(&b.0.file_path))
-                .then(a.0.start_byte.cmp(&b.0.start_byte))
-                .then(a.0.symbol_id.cmp(&b.0.symbol_id))
+    // The global FTS cap precedes filters. Keep first-score and repeated-why semantics.
+    let candidates = session.query_scoped_candidate_inventory_with_control(
+        text,
+        &QueryCandidateFilter {
+            language: filters.language,
+            kind: filters.kind,
+            path_prefix: filters.path_prefix,
         },
         control,
     )?;
-    let more = hits.len() > offset.saturating_add(limit);
-    let mut page = Vec::with_capacity(limit.min(hits.len()));
-    for (entry, score, why_matched) in hits.into_iter().skip(offset).take(limit) {
+    control.check()?;
+    let mut fts_by_id = HashMap::with_capacity(candidates.fts.len());
+    for (id, score) in &candidates.fts {
+        let row = fts_by_id.entry(id.as_str()).or_insert((*score, 0usize));
+        row.1 += 1;
+    }
+    let inventory = candidates.items;
+    control.check()?;
+    let lower = text.to_lowercase();
+    let end = offset + limit;
+    let mut best = BinaryHeap::with_capacity(end.min(inventory.len()));
+    let mut count = 0usize;
+    for entry in &inventory {
         control.check()?;
+        if !matches(filters, entry) {
+            continue;
+        }
+        let lexical = lexical_score(entry, text, &lower);
+        let fts = fts_by_id.get(entry.symbol_id.as_str());
+        let (score, why) = match (lexical, fts) {
+            (Some((score, why)), _) => (score, Some(why)),
+            (None, Some((score, _))) => (100. + (-score).min(99.), None),
+            (None, None) => continue,
+        };
+        let ranked = Ranked {
+            entry,
+            score,
+            lexical: why,
+            fts_count: fts.map_or(0, |row| row.1),
+        };
+        count += 1;
+        // The maximum heap entry is the WORST retained rank, not the best result.
+        if best.len() < end {
+            best.push(ranked);
+        } else if let Some(mut worst) = best.peek_mut()
+            && ranked < *worst
+        {
+            *worst = ranked;
+        }
+    }
+    let mut hits = best.into_vec();
+    sort_with_control(&mut hits, Ord::cmp, control)?;
+    let more = count > end;
+    let mut page = Vec::with_capacity(limit.min(hits.len()));
+    for ranked in hits.into_iter().skip(offset).take(limit) {
+        control.check()?;
+        let entry = ranked.entry;
         let symbol = session.get_symbol(&entry.symbol_id)?.ok_or_else(|| {
             Error::new(
                 "CORRUPT_INDEX",
@@ -119,9 +185,17 @@ pub fn query_projected_with_control(
                 6,
             ));
         }
+        let mut why_matched =
+            Vec::with_capacity(usize::from(ranked.lexical.is_some()) + ranked.fts_count);
+        if let Some(why) = ranked.lexical {
+            why_matched.push(why.into());
+        }
+        for _ in 0..ranked.fts_count {
+            why_matched.push("fts5_bm25".into());
+        }
         page.push(Hit {
             symbol,
-            score,
+            score: ranked.score,
             why_matched,
         });
     }

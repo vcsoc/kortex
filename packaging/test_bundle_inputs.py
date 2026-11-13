@@ -139,5 +139,56 @@ class BundleInputTests(unittest.TestCase):
             collect_notices(metadata, root, include_frontend=True)
 
 
+class ExternalFrontendTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="kortex-external-frontend-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.project = self.root / "source"
+        self.web = self.root / "installed-web"
+        for path in (self.project / "web", self.project / "packaging/notices", self.web):
+            path.mkdir(parents=True)
+        (self.project / "packaging/notices/index.json").write_text('{"notices":[]}')
+        for root in (self.project / "web", self.web):
+            (root / "package.json").write_text('{"private":true}')
+            (root / "package-lock.json").write_text(json.dumps({"packages": {
+                "node_modules/example": {"version": "1.0.0"}}}))
+        package = self.web / "node_modules/example"
+        package.mkdir(parents=True)
+        (package / "LICENSE").write_text("Exact external dependency notice")
+        self.metadata = {"workspace_members": [], "packages": []}
+
+    def test_matching_external_install_supplies_notices_without_source_mutation(self):
+        files = collect_notices(self.metadata, self.project, True, self.web)
+        self.assertEqual(files["third-party/npm/example-1.0.0/LICENSE"], b"Exact external dependency notice")
+        self.assertFalse((self.project / "web/node_modules").exists())
+
+    def test_external_manifest_or_lock_mismatch_is_refused(self):
+        for name in ("package.json", "package-lock.json"):
+            path = self.web / name
+            original = path.read_bytes()
+            path.write_bytes(original + b" ")
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "differs from frozen"):
+                collect_notices(self.metadata, self.project, True, self.web)
+            path.write_bytes(original)
+
+    def test_external_install_without_frontend_bundle_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "external frontend"):
+            collect_notices(self.metadata, self.project, False, self.web)
+
+    @unittest.skipUnless(os.name == "posix", "symlink fixture requires native privilege")
+    def test_external_root_and_dependency_aliases_are_refused(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.web, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "external frontend"):
+            collect_notices(self.metadata, self.project, True, alias)
+        package = self.web / "node_modules/example"
+        (package / "LICENSE").unlink()
+        package.rmdir()
+        package.symlink_to(self.project / "web", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "escapes frontend"):
+            collect_notices(self.metadata, self.project, True, self.web)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,57 @@
 # Application intelligence checkpoint
 
+## Query-performance continuation: READY implementation slice, NOT performance acceptance
+
+**Final owned source is frozen for parent review.** Search consumes storage's additive `query_candidate_inventory_with_control(text, &QueryCandidateFilter, &RequestControl)` on the SAME pinned Store. The actual caller control reaches storage's Rust row/filter loop. Existing eager search/Service remain unchanged comparison oracles; normal context/impact still explicitly materialize the SAME Store and are NOT claimed optimized.
+
+Implemented substantive query changes:
+
+- Storage's exact candidate union replaces allocating the full inventory in search. Original global FTS500 precedes filters; Rust Unicode/contextual lowercasing and literal `%`/`_` semantics remain, and embedded-NUL query errors match eager FTS rather than silently truncating or claiming success.
+- Search keeps only the best `offset+limit` borrowed ranks in a worst-first heap (maximum100500), sorts that window with cooperative control, and creates explanation Strings/full Symbols ONLY for the returned page. Exact scores/path-byte-ID ties/why multiplicity/selected-fact consistency remain. ASCII-only comparisons avoid transient lowercase allocations without replacing Unicode rules.
+- ReadService caches immutable original-order file inventory and authoritative parser partial evidence ONLY inside its actual owned immutable pinned reader. One retry-page slot is keyed by text/all filters/resolved offset and can serve smaller limits; it has a separately tested256KiB SERIALIZED-data cap and never stores whole envelopes/freshness. Each retry still validates policy/cursors, reads/hashes current sources and rebuilds budgets/warnings/cursors. No global generation token/cache, additional reader, globally pinned WAL or cross-request eager snapshot is introduced.
+- New regressions compare complete eager responses through retry/filter/offset/limit changes and same-size source edits; a real intervening publication retires then REUSES the original generation ID while old/new readers retain DIFFERENT facts/partial evidence, proving an ID alone cannot authorize cache reuse. Large-response fixture proves the retry cap even with a larger repository response budget. Contextual sigma/Turkish Unicode/literal wildcard/NUL error parity and1500-way ties/top-window boundaries pass. Existing native cache4GiB pre-SQL journal cap and all native-cache regressions remain unchanged and passing. No pretrained/default model activation.
+
+Final executed verification (all locked/offline):
+
+```sh
+cargo build -p kortex-cli -p kortex-analysis --all-features --release --locked --offline --bin kortex --example query_profile
+KORTEX_TEST_CLI="$PWD/target/release/kortex" cargo test -p kortex-analysis -p kortex-search -p kortex-graph --all-features --locked --offline -- --include-ignored
+cargo clippy -p kortex-analysis -p kortex-search -p kortex-graph --all-targets --all-features --locked --offline -- -D warnings
+cargo fmt -p kortex-analysis -p kortex-search -p kortex-graph -- --check
+git diff --check -- crates/kortex-analysis crates/kortex-search crates/kortex-graph docs/crew-intelligence.md
+```
+
+**93 PASS = analysis63/search25/graph5; zero ignored**, including the actually executed rebuilt releaseCLI lazy-query/unused-blob and eager-context refusal proof. Strict scoped all-target/all-feature clippy, owned fmt and whitespace PASS. Logs `target/query-perf-final-{build,tests,clippy,fmt}.log`. Owned changes ONLY analysis/search plus this handoff (graph unmodified); no peer/root/core/indexer/config/storage/transport/lock edit, delegation, unsafe, source execution/download/upload, listener, commit/reset/clean/push/publish/deploy or hosted approval. GitNexus impacts unavailable/unindexed; actual diff/direct callers reviewed. Parent owns independent review, workspace/transport/coverage/platform checks and final quiescent comparison.
+
+### Preserved CONTENDED full-size diagnostic, NOT a speedup claim
+
+The ONE authorized100k-functions/10k-files/110k-symbols/320k-edges10-sample run completed while storage profiling was also active. **ALL overlapping timings are CONTENDED**, not p95/reference/quiescent acceptance or causal speed/memory improvement. Complete normalized eager/lazy responses, complete same-reader retries/smaller-limit responses and actual rebuilt releaseCLI responses ALL compared equal; only request_id/timing_ms are normalized. No hidden eager query materialization. Dataset BLAKE3 remains `3d03be3f05a84b6a4963bf410c12ce055a8a5fac588e88d6815f12cfafa89bf3`.
+
+Raw range ms: projection validation583.829–4355.614; candidate inventory322.641–942.046 (retained candidates0/11/500/10000, versus110k full rows); projected retrieval346.908–999.685; COMPLETE first lazy execution INCLUDING validation+freshness1273.437–7857.713; same-reader full-hash retry254.833–924.791; smaller-limit full-hash retry284.924–518.414; actual releaseCLI3318.176–5418.198. Eager open541.593–1512.540 plus execute363.393–972.017 are separate phases. Actual CLI RSS27,295,744–32,735,232bytes; whole-profiler maxRSS1,196,441,600bytes INCLUDES fixtures/eager comparisons, not per-query memory. Index33.509s. These observations are severe contended diagnostic regressions, NOT accepted latency or a universal win. No further large benchmark was run after parent requested quiescence; parent will run the single controlled comparison after all owners finish.
+
+Artifacts `target/query-perf-100k-profile.log`, `target/query-perf-binaries.sha256`; measured binaries PRESERVED as `target/release/kortex-query-perf-contended` SHA256 `782ed95e6fcca322081eba2aed6b929b8ac6ef143cf65bbbf540fe5254990e03` and `target/release/examples/query_profile-query-perf-contended` SHA256 `9ede090edb8d91b3cf9b2428b35d1ba0a7e8f68a986480ae9f6180e263188717`. Measured profiler embeds its source BLAKE3 `c603437b1b71981724c05f857e45b86e5df37a5a53804ff1975c5db52e407c22` and both executable BLAKE3 values in the log. Baseline parent logs/binaries retained. The final source adds the controlled candidate API and page-cap regression AFTER that diagnostic; those final deltas are tested/rebuilt, deliberately NOT rebenchmarked.
+
+Final freshly rebuilt CLI SHA256 `2c18fc07adec70699163a670ba16a1a1cb49c0326b874cc6440632c5692de271`; final profiler SHA256 `68b4dfb19475975b72a5041e904af88085dcc72c7edd502ca525368aec1919c5`. Final owned Rust/Cargo source41 files, sorted workspace-relative `path + NUL + contents + NUL`, SHA256 `04876af79bb75a182905f0c7ee9c644556f4b11146c1bd70fbc129a069db6111`. Profiler now measures the FIRST complete lazy execution without priming freshness/validation, reports candidate counts/phase/RSS, and asserts complete eager equivalence for both retry forms and realCLI. No performance acceptance/model quality/schema2/migration claim.
+
+## Active query-performance continuation: EARLY storage dependency (superseded by READY above)
+
+**Storage alternative contract ADOPTED in search source (pending peer completion + compile/tests):** `ReadSession::query_candidate_inventory(text, &QueryCandidateFilter {language,kind,path_prefix}) -> Result<QueryCandidateInventory {items,fts}>`, as published in `docs/crew-storage-performance.md`. Search uses original global FTS500 from returned `fts` and rank/why/ties remain search-owned. Initial build was blocked inside in-progress storage code (missing exports / moved projection cache field), NOT a passing test. Please consider a control-aware variant for checkpoints inside the new Rust streaming filter loop; current caller checks before/after, as with prior inventory SQL, but does not claim hard preemption.
+
+Earlier equivalent requested additive SAME-pinned-session API (superseded by the adopted signature):
+
+```rust
+impl ReadSession<'_> {
+    pub fn query_symbol_inventory(
+        &self, text: &str, language: Option<&str>, kind: Option<&str>,
+        path_prefix: Option<&str>, fts_ids: &[String],
+    ) -> Result<Vec<SymbolInventoryEntry>>;
+}
+```
+
+Return the UNION of lexical candidates and supplied FTS IDs, applying language/kind/case-sensitive literal path-prefix filters to both; no candidate limit and original inventory ordinal order. Lexical candidates are exact name/qualified-name OR Rust Unicode `to_lowercase` name prefix/qualified substring/path substring. `%`, `_`, embedded NUL and Unicode expansion must behave exactly as Rust strings, NOT SQLite lower/LIKE. Search calls existing global `keyword(text,500)` BEFORE filters and passes those IDs; storage does not own rank/why/tie policy. Alternate concrete signature is fine if published early. No raw SQL/duplicate storage policy/second reader in this owner. Mesh messaging is OFF, so this shared document and native report are the early relay. Existing pinned-session inventory API remains usable meanwhile.
+
+Planned application cache lifetime is ONLY the actual owned pinned ReadService; no global generation-ID key, no cross-request eager snapshot, no retained global WAL reader. Production freshness still hashes every current source on every execution. Context/impact stay explicit eager fallback. GitNexus impacts for projected query and ReadService report UNINDEXED; direct search -> ReadService -> shared execution/CLI/MCP/HTTP callers inspected. This is contract-sensitive/high-risk ranking work: complete retained eager responses remain the comparison oracle. No performance acceptance or speedup claim yet.
+
 ## Parent Integration: Lazy Query Adopted, Performance Gate Still Open
 
 Storage published original-file-order evidence after the blocked checkpoint below. Parent independently reviewed projected ranking/selected-fact consistency, fixed only the legacy fixture SETUP to remove all optional new projection evidence, and added a separate orphan-current-row CORRUPT_INDEX/no-eager-downgrade regression. Manifest-only deletion remains refused; no production safety check was weakened.

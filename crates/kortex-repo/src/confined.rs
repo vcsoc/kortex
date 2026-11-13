@@ -38,19 +38,32 @@ pub(crate) fn read_opened_bytes(
     read_opened_bytes_counted(file, max, control, &mut crate::ConfinedReadStats::default())
 }
 
+pub(crate) const READ_CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) type ReadScratch = [u8; READ_CHUNK_BYTES];
+
 pub(crate) fn read_opened_bytes_counted(
     file: File,
     max: u64,
     control: Option<&kortex_core::RequestControl>,
     stats: &mut crate::ConfinedReadStats,
 ) -> Result<Vec<u8>> {
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    read_opened_bytes_with_scratch(file, max, control, stats, &mut chunk)
+}
+
+pub(crate) fn read_opened_bytes_with_scratch(
+    file: File,
+    max: u64,
+    control: Option<&kortex_core::RequestControl>,
+    stats: &mut crate::ConfinedReadStats,
+    chunk: &mut ReadScratch,
+) -> Result<Vec<u8>> {
     let mut reader = file.take(max.saturating_add(1));
     let mut bytes = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
     loop {
         crate::checkpoint(control)?;
         stats.read_calls += 1;
-        let count = match reader.read(&mut chunk) {
+        let count = match reader.read(chunk) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             result => result?,
         };

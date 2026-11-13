@@ -1,11 +1,23 @@
 //! Real Tree-sitter providers. Facts are immutable; resolution is a separate pass.
-use kortex_core::{Error, Import, ParsedFile, Reference, Result, Span, Symbol, hash, id};
+use kortex_core::{
+    Error, Import, ParsedFile, Reference, RequestControl, Result, Span, Symbol, hash, id,
+};
 use serde_json as kortex_json;
-use std::time::{Duration, Instant};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 use tree_sitter::{Language, Node, ParseOptions, Parser};
+mod bounds;
+#[cfg(test)]
+mod emission_tests;
 mod extended;
+mod output;
 mod p0;
 mod semantic;
+pub use bounds::{ParseLimits, parsed_file_bytes};
+use output::Sink;
+pub use output::{OutputLimits, check_output_limits};
 
 pub trait LanguageProvider: Send + Sync {
     fn id(&self) -> &'static str;
@@ -71,13 +83,81 @@ fn grammar(lang: &str, path: &str) -> Result<Language> {
         _ => return Err(Error::new("UNSUPPORTED_LANGUAGE", lang, 7)),
     })
 }
+/// Trusted compatibility API. Production indexing uses `parse_bounded`.
 pub fn parse(repo: &str, path: &str, lang: &str, source: &str) -> Result<ParsedFile> {
+    parse_impl(repo, path, lang, source, None, None, None)
+}
+/// Admit AST shape before extraction. This is not a per-emission allocation bound;
+/// the indexer separately admits aggregate facts before retaining worker results.
+pub fn parse_bounded(
+    repo: &str,
+    path: &str,
+    lang: &str,
+    source: &str,
+    limits: &ParseLimits,
+) -> Result<ParsedFile> {
+    parse_impl(repo, path, lang, source, Some(limits), None, None)
+}
+/// Admit both AST structure and incremental output, including post-emission metadata.
+/// Resource refusal aborts the entire parse; this API never returns truncated facts.
+pub fn parse_bounded_with_output_limits(
+    repo: &str,
+    path: &str,
+    lang: &str,
+    source: &str,
+    limits: &ParseLimits,
+    output_limits: &OutputLimits,
+) -> Result<ParsedFile> {
+    parse_impl(
+        repo,
+        path,
+        lang,
+        source,
+        Some(limits),
+        Some(output_limits),
+        None,
+    )
+}
+/// The same admission contract with cooperative native parsing/AST/emission cancellation.
+pub fn parse_bounded_with_output_limits_and_control(
+    repo: &str,
+    path: &str,
+    lang: &str,
+    source: &str,
+    limits: &ParseLimits,
+    output_limits: &OutputLimits,
+    control: &RequestControl,
+) -> Result<ParsedFile> {
+    parse_impl(
+        repo,
+        path,
+        lang,
+        source,
+        Some(limits),
+        Some(output_limits),
+        Some(control),
+    )
+}
+fn parse_impl(
+    repo: &str,
+    path: &str,
+    lang: &str,
+    source: &str,
+    limits: Option<&ParseLimits>,
+    output_limits: Option<&OutputLimits>,
+    control: Option<&RequestControl>,
+) -> Result<ParsedFile> {
+    if let Some(control) = control {
+        control.check()?;
+    }
     let mut parser = Parser::new();
     parser
         .set_language(&grammar(lang, path)?)
         .map_err(|e| Error::new("GRAMMAR_ERROR", e.to_string(), 7))?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut cancel = |_: &tree_sitter::ParseState| Instant::now() > deadline;
+    let mut cancel = |_: &tree_sitter::ParseState| {
+        Instant::now() > deadline || control.is_some_and(|c| c.check().is_err())
+    };
     let bytes = source.as_bytes();
     let tree = parser
         .parse_with_options(
@@ -85,25 +165,80 @@ pub fn parse(repo: &str, path: &str, lang: &str, source: &str) -> Result<ParsedF
             None,
             Some(ParseOptions::new().progress_callback(&mut cancel)),
         )
-        .ok_or_else(|| Error::new("PARSE_TIMEOUT", "parser exceeded five seconds", 9))?;
-    let mut file = ParsedFile {
-        path: path.into(),
-        language: lang.into(),
-        content_hash: hash(source),
-        size_bytes: source.len(),
-        symbols: vec![],
-        references: vec![],
-        imports: vec![],
-        import_scopes: vec![],
-        import_spans: vec![],
-        diagnostics: vec![],
-    };
-    if tree.root_node().has_error() {
-        file.diagnostics
-            .push(format!("{path}: syntax errors; facts may be partial"));
+        .ok_or_else(|| {
+            control
+                .and_then(|c| c.check().err())
+                .unwrap_or_else(|| Error::new("PARSE_TIMEOUT", "parser exceeded five seconds", 9))
+        })?;
+    if let Some(control) = control {
+        control.check()?;
+    }
+    if let Some(limits) = limits {
+        bounds::admit_with_control(tree.root_node(), limits, control)?;
+    }
+    let mut file = file_node(
+        tree.root_node(),
+        repo,
+        path,
+        lang,
+        source,
+        output_limits,
+        control,
+    )?;
+    let file_id = id(&[repo, lang, path, "file"]);
+    if extended::supports(lang) {
+        extended::extract(tree.root_node(), source, repo, &mut file, &file_id)?;
+    } else {
+        walk(tree.root_node(), source, repo, &mut file, &file_id, "", 0)?;
+        p0::finish(tree.root_node(), source, &mut file)?;
+    }
+    if limits.is_some()
+        && file.diagnostics.iter().any(|d| {
+            matches!(
+                d.as_str(),
+                "AST depth limit reached" | "binding expansion limit reached"
+            )
+        })
+    {
+        return Err(Error::new(
+            "RESOURCE_LIMIT",
+            "per-file extraction limit reached",
+            9,
+        ));
+    }
+    file.checkpoint()?;
+    Ok(file.finish())
+}
+fn file_node(
+    root: Node<'_>,
+    repo: &str,
+    path: &str,
+    lang: &str,
+    source: &str,
+    limits: Option<&OutputLimits>,
+    control: Option<&RequestControl>,
+) -> Result<Sink> {
+    let mut file = Sink::new(
+        ParsedFile {
+            path: path.into(),
+            language: lang.into(),
+            content_hash: hash(source),
+            size_bytes: source.len(),
+            symbols: vec![],
+            references: vec![],
+            imports: vec![],
+            import_scopes: vec![],
+            import_spans: vec![],
+            diagnostics: vec![],
+        },
+        limits,
+        control,
+    )?;
+    if root.has_error() {
+        file.diagnostic(format!("{path}: syntax errors; facts may be partial"))?;
     }
     let file_id = id(&[repo, lang, path, "file"]);
-    file.symbols.push(Symbol {
+    file.symbol(Symbol {
         symbol_id: file_id.clone(),
         symbol_revision_id: id(&[&file_id, &file.content_hash]),
         repo_id: repo.into(),
@@ -112,30 +247,15 @@ pub fn parse(repo: &str, path: &str, lang: &str, source: &str) -> Result<ParsedF
         name: path.into(),
         qualified_name: path.into(),
         file_path: path.into(),
-        span: span(tree.root_node()),
+        span: span(root),
         signature: String::new(),
         visibility: "unknown".into(),
-        attributes: serde_value(),
+        attributes: kortex_json::json!({}),
         content_hash: file.content_hash.clone(),
         doc_comment: None,
         owner_id: None,
-    });
-    if extended::supports(lang) {
-        extended::extract(tree.root_node(), source, repo, &mut file, &file_id);
-    } else {
-        walk(tree.root_node(), source, repo, &mut file, &file_id, "", 0);
-        p0::finish(tree.root_node(), source, &mut file);
-    }
-    file.symbols.sort_by(|a, b| {
-        a.span
-            .start_byte
-            .cmp(&b.span.start_byte)
-            .then(a.symbol_id.cmp(&b.symbol_id))
-    });
+    })?;
     Ok(file)
-}
-fn serde_value() -> kortex_json::Value {
-    kortex_json::json!({})
 }
 
 fn declaration(n: Node<'_>) -> Option<&'static str> {
@@ -181,28 +301,30 @@ fn walk(
     n: Node<'_>,
     source: &str,
     repo: &str,
-    file: &mut ParsedFile,
+    file: &mut Sink,
     owner: &str,
     prefix: &str,
     depth: usize,
-) {
+) -> Result<()> {
+    file.checkpoint()?;
     if depth > 256 {
         if !file
             .diagnostics
             .iter()
             .any(|d| d == "AST depth limit reached")
         {
-            file.diagnostics.push("AST depth limit reached".into());
+            file.extraction_limit("AST depth limit reached")?;
         }
-        return;
+        return Ok(());
     }
     let mut current = owner.to_owned();
-    let mut qualified = prefix.to_owned();
+    // Most AST nodes do not change qualification; retain the ancestor's borrow.
+    let mut qualified = Cow::Borrowed(prefix);
     // impl blocks are scopes, not declarations; retain the receiver in qualified names.
     if n.kind() == "impl_item"
         && let Some(t) = n.child_by_field_name("type")
     {
-        qualified = join(prefix, text(t, source));
+        qualified = Cow::Owned(join(prefix, text(t, source)));
     }
     if file.language == "go"
         && n.kind() == "method_declaration"
@@ -213,7 +335,7 @@ fn walk(
             .named_children(&mut c)
             .find_map(|p| p.child_by_field_name("type"))
         {
-            qualified = join(prefix, text(ty, source).trim_start_matches('*'));
+            qualified = Cow::Owned(join(prefix, text(ty, source).trim_start_matches('*')));
         }
     }
     if let Some(kind) = declaration(n)
@@ -233,7 +355,7 @@ fn walk(
         })
     {
         let name = text(name_node, source);
-        qualified = join(&qualified, name);
+        qualified = Cow::Owned(join(&qualified, name));
         let signature_end = n
             .child_by_field_name("body")
             .map(|b| b.start_byte())
@@ -245,7 +367,7 @@ fn walk(
         let ordinal = file
             .symbols
             .iter()
-            .filter(|s| s.qualified_name == qualified && s.kind == kind)
+            .filter(|s| s.qualified_name == qualified.as_ref() && s.kind == kind)
             .count()
             .to_string();
         let symbol_id = id(&[repo, &file.language, &file.path, kind, &qualified, &ordinal]);
@@ -256,14 +378,14 @@ fn walk(
         let test =
             name.starts_with("test_") || prev.is_some_and(|p| text(p, source).contains("#[test]"));
         let declaration_scope = semantic::declaration_scope(n, &file.language);
-        file.symbols.push(Symbol {
+        file.symbol(Symbol {
             symbol_revision_id: id(&[&symbol_id, &hash(text(n, source))]),
             symbol_id: symbol_id.clone(),
             repo_id: repo.into(),
             kind: if test { "test" } else { kind }.into(),
             language: file.language.clone(),
             name: name.into(),
-            qualified_name: qualified.clone(),
+            qualified_name: qualified.to_string(),
             file_path: file.path.clone(),
             span: span(n),
             signature,
@@ -272,22 +394,21 @@ fn walk(
             content_hash: hash(text(n, source)),
             doc_comment: doc,
             owner_id: Some(owner.into()),
-        });
+        })?;
         current = symbol_id;
     }
-    semantic::members(n, source, file, &current);
-    let imports_before = file.imports.len();
+    semantic::members(n, source, file, &current)?;
     match n.kind() {
         "package_clause" => {
             if let Some(package) = n.named_child(0)
-                && let Some(s) = file.symbols.iter_mut().find(|s| s.kind == "file")
+                && let Some(i) = file.symbols.iter().position(|s| s.kind == "file")
             {
-                s.attributes["package"] = kortex_json::json!(text(package, source));
+                file.attribute(i, "package", kortex_json::json!(text(package, source)))?;
             }
         }
         "use_declaration" => {
             if let Some(arg) = n.child_by_field_name("argument") {
-                rust_use(arg, source, "", &mut file.imports);
+                rust_use(arg, source, "", file, &current, span(n))?;
             }
         }
         "import_from_statement" => {
@@ -302,11 +423,15 @@ fn walk(
                 }
                 let (original, local) = aliased(a, source);
                 if !original.is_empty() {
-                    file.imports.push(Import {
-                        local,
-                        module: module.into(),
-                        imported: original,
-                    });
+                    file.import(
+                        Import {
+                            local,
+                            module: module.into(),
+                            imported: original,
+                        },
+                        current.clone(),
+                        span(n),
+                    )?;
                 }
             }
         }
@@ -314,11 +439,15 @@ fn walk(
             let mut c = n.walk();
             for a in n.named_children(&mut c) {
                 let (module, alias) = aliased(a, source);
-                file.imports.push(Import {
-                    local: alias,
-                    module,
-                    imported: "*".into(),
-                });
+                file.import(
+                    Import {
+                        local: alias,
+                        module,
+                        imported: "*".into(),
+                    },
+                    current.clone(),
+                    span(n),
+                )?;
             }
         }
         "import_statement" => {
@@ -326,7 +455,7 @@ fn walk(
                 .child_by_field_name("source")
                 .map(|a| unquote(text(a, source)))
                 .unwrap_or_default();
-            js_imports(n, source, &module, &mut file.imports);
+            js_imports(n, source, &module, file, &current, span(n))?;
         }
         "import_spec" => {
             if let Some(p) = n.child_by_field_name("path") {
@@ -335,11 +464,15 @@ fn walk(
                     .child_by_field_name("name")
                     .map(|a| text(a, source).to_owned())
                     .unwrap_or_else(|| module.rsplit('/').next().unwrap_or("").into());
-                file.imports.push(Import {
-                    local,
-                    module,
-                    imported: "*".into(),
-                });
+                file.import(
+                    Import {
+                        local,
+                        module,
+                        imported: "*".into(),
+                    },
+                    current.clone(),
+                    span(n),
+                )?;
             }
         }
         "call_expression" | "call" => {
@@ -348,21 +481,21 @@ fn walk(
                 if !full.contains(['(', ')', '[', ']', ' ', '\n']) {
                     let (qualifier, name) = split_name(full);
                     if file.language == "rust" && callee.kind() == "field_expression" {
-                        semantic::unknown_receiver(file, &current, n.start_byte());
+                        semantic::unknown_receiver(file, &current, n.start_byte())?;
                     }
-                    file.references.push(Reference {
+                    file.reference(Reference {
                         source_id: current.clone(),
                         name: name.into(),
                         qualifier: qualifier.map(str::to_owned),
                         span: span(n),
                         kind: "CALLS".into(),
-                    });
+                    })?;
                 } else {
-                    file.diagnostics.push(format!(
+                    file.diagnostic(format!(
                         "{}:{}: dynamic callee unsupported",
                         file.path,
                         n.start_position().row + 1
-                    ));
+                    ))?;
                 }
             }
         }
@@ -370,17 +503,17 @@ fn walk(
         "parameter_declaration" if file.language == "go" => {
             let mut c = n.walk();
             for name in n.children_by_field_name("name", &mut c) {
-                record_binding(name, source, file, &current);
+                record_binding(name, source, file, &current)?;
             }
         }
         "catch_clause" => {
             if let Some(binding) = n.child_by_field_name("parameter") {
-                record_binding(binding, source, file, &current);
+                record_binding(binding, source, file, &current)?;
             }
         }
         "for_expression" => {
             if let Some(binding) = n.child_by_field_name("pattern") {
-                record_binding(binding, source, file, &current);
+                record_binding(binding, source, file, &current)?;
             }
         }
         "parameter"
@@ -397,7 +530,7 @@ fn walk(
                     .or_else(|| n.child_by_field_name("name"))
                     .or_else(|| n.named_child(0).filter(|n| n.kind() == "identifier"));
                 if let Some(b) = binding {
-                    record_binding(b, source, file, &current);
+                    record_binding(b, source, file, &current)?;
                 }
             }
         }
@@ -405,40 +538,37 @@ fn walk(
             let mut c = n.walk();
             for b in n.named_children(&mut c) {
                 if b.kind() == "identifier" {
-                    record_binding(b, source, file, &current);
+                    record_binding(b, source, file, &current)?;
                 }
             }
         }
         "short_var_declaration" | "for_statement" => {
             if let Some(left) = n.child_by_field_name("left") {
-                record_binding(left, source, file, &current);
+                record_binding(left, source, file, &current)?;
             }
         }
         "var_spec" => {
             let mut c = n.walk();
             for child in n.named_children(&mut c) {
                 if child.kind() == "identifier" {
-                    record_binding(child, source, file, &current);
+                    record_binding(child, source, file, &current)?;
                 }
             }
         }
-        "assignment_expression" => semantic::mutation(n, source, file, &current),
+        "assignment_expression" => semantic::mutation(n, source, file, &current)?,
         "assignment" if file.language == "python" => {
             if let Some(b) = n.child_by_field_name("left") {
-                record_binding(b, source, file, &current);
+                record_binding(b, source, file, &current)?;
             }
         }
         _ => {}
     }
-    for _ in imports_before..file.imports.len() {
-        file.import_scopes.push(current.clone());
-        file.import_spans.push(span(n));
-    }
-    semantic::reference(n, source, file, &current);
+    semantic::reference(n, source, file, &current)?;
     let mut c = n.walk();
     for child in n.named_children(&mut c) {
-        walk(child, source, repo, file, &current, &qualified, depth + 1);
+        walk(child, source, repo, file, &current, &qualified, depth + 1)?;
     }
+    Ok(())
 }
 fn exported(n: Node<'_>, source: &str) -> (bool, bool) {
     let mut p = n.parent();
@@ -456,8 +586,8 @@ fn exported(n: Node<'_>, source: &str) -> (bool, bool) {
     }
     (false, false)
 }
-fn record_binding(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str) {
-    semantic::binding(n, source, file, owner);
+fn record_binding(n: Node<'_>, source: &str, file: &mut Sink, owner: &str) -> Result<()> {
+    semantic::binding(n, source, file, owner)
 }
 fn join(a: &str, b: &str) -> String {
     if a.is_empty() {
@@ -489,7 +619,14 @@ fn aliased(n: Node<'_>, s: &str) -> (String, String) {
         .unwrap_or(original);
     (original.into(), local.into())
 }
-fn rust_use(n: Node<'_>, s: &str, prefix: &str, imports: &mut Vec<Import>) {
+fn rust_use(
+    n: Node<'_>,
+    s: &str,
+    prefix: &str,
+    file: &mut Sink,
+    owner: &str,
+    site: Span,
+) -> Result<()> {
     match n.kind() {
         "scoped_use_list" => {
             let path = n
@@ -498,13 +635,13 @@ fn rust_use(n: Node<'_>, s: &str, prefix: &str, imports: &mut Vec<Import>) {
                 .unwrap_or("");
             let p = join(prefix, path);
             if let Some(list) = n.child_by_field_name("list") {
-                rust_use(list, s, &p, imports);
+                rust_use(list, s, &p, file, owner, site)?;
             }
         }
         "use_list" => {
             let mut c = n.walk();
             for child in n.named_children(&mut c) {
-                rust_use(child, s, prefix, imports);
+                rust_use(child, s, prefix, file, owner, site.clone())?;
             }
         }
         "use_as_clause" => {
@@ -518,65 +655,94 @@ fn rust_use(n: Node<'_>, s: &str, prefix: &str, imports: &mut Vec<Import>) {
                 .unwrap_or("");
             let full = join(prefix, path);
             let (module, name) = split_name(&full);
-            imports.push(Import {
-                local: alias.into(),
-                module: module.unwrap_or("").into(),
-                imported: name.into(),
-            });
+            file.import(
+                Import {
+                    local: alias.into(),
+                    module: module.unwrap_or("").into(),
+                    imported: name.into(),
+                },
+                owner.into(),
+                site,
+            )?;
         }
         _ => {
             let full = join(prefix, text(n, s));
             let (module, name) = split_name(&full);
-            imports.push(Import {
-                local: name.into(),
-                module: module.unwrap_or("").into(),
-                imported: name.into(),
-            });
+            file.import(
+                Import {
+                    local: name.into(),
+                    module: module.unwrap_or("").into(),
+                    imported: name.into(),
+                },
+                owner.into(),
+                site,
+            )?;
         }
     }
+    Ok(())
 }
-fn js_imports(n: Node<'_>, s: &str, module: &str, imports: &mut Vec<Import>) {
+fn js_imports(
+    n: Node<'_>,
+    s: &str,
+    module: &str,
+    file: &mut Sink,
+    owner: &str,
+    site: Span,
+) -> Result<()> {
     match n.kind() {
         "import_specifier" => {
             let (original, local) = aliased(n, s);
-            imports.push(Import {
-                local,
-                module: module.into(),
-                imported: original,
-            });
-            return;
+            file.import(
+                Import {
+                    local,
+                    module: module.into(),
+                    imported: original,
+                },
+                owner.into(),
+                site,
+            )?;
+            return Ok(());
         }
         "namespace_import" => {
             if let Some(a) = n.named_child(0) {
-                imports.push(Import {
-                    local: text(a, s).into(),
-                    module: module.into(),
-                    imported: "*".into(),
-                });
+                file.import(
+                    Import {
+                        local: text(a, s).into(),
+                        module: module.into(),
+                        imported: "*".into(),
+                    },
+                    owner.into(),
+                    site,
+                )?;
             }
-            return;
+            return Ok(());
         }
         "import_clause" => {
             let mut c = n.walk();
             for a in n.named_children(&mut c) {
                 if a.kind() == "identifier" {
-                    imports.push(Import {
-                        local: text(a, s).into(),
-                        module: module.into(),
-                        imported: "default".into(),
-                    });
+                    file.import(
+                        Import {
+                            local: text(a, s).into(),
+                            module: module.into(),
+                            imported: "default".into(),
+                        },
+                        owner.into(),
+                        site.clone(),
+                    )?;
                 } else {
-                    js_imports(a, s, module, imports);
+                    js_imports(a, s, module, file, owner, site.clone())?;
                 }
             }
-            return;
+            return Ok(());
         }
         _ => {}
     }
     let mut c = n.walk();
     for a in n.named_children(&mut c) {
-        js_imports(a, s, module, imports);
+        js_imports(a, s, module, file, owner, site.clone())?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

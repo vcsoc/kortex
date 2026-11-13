@@ -6,6 +6,80 @@ fn control() -> RequestControl {
 }
 
 #[test]
+fn reused_scratch_never_exposes_prior_file_bytes_after_short_reads_or_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let large = vec![0xa5; 2 * crate::confined::READ_CHUNK_BYTES + 37];
+    fs::write(root.join("large"), &large).unwrap();
+    fs::write(root.join("short"), b"tiny").unwrap();
+    fs::write(root.join("empty"), []).unwrap();
+    fs::write(root.join("binary"), [0, 0xff]).unwrap();
+    fs::write(root.join("invalid"), [0xff]).unwrap();
+    let mut reader = ConfinedReader::new(&root).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            reader
+                .read_bytes("large", large.len() as u64, &control())
+                .unwrap(),
+            large
+        );
+        assert_eq!(reader.read_bytes("short", 4, &control()).unwrap(), b"tiny");
+        assert!(
+            reader
+                .read_bytes("empty", 0, &control())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader.read_bytes("large", 17, &control()).unwrap_err().code,
+            "FILE_TOO_LARGE"
+        );
+        assert!(
+            reader
+                .read_bytes("empty", u64::MAX, &control())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader.read("binary", 2, &control()).unwrap_err().code,
+            "BINARY_FILE"
+        );
+        assert_eq!(
+            reader.read("invalid", 1, &control()).unwrap_err().code,
+            "INVALID_ENCODING"
+        );
+        assert_eq!(reader.read("short", u64::MAX, &control()).unwrap(), "tiny");
+    }
+    assert_eq!(reader.stats().root_opens, 1);
+}
+
+#[test]
+fn reused_scratch_keeps_real_eof_authoritative_after_growth_and_shrink() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut reader = ConfinedReader::new(&root).unwrap();
+    for size in [0, 1, 65535, 65536, 65537, 3, 0] {
+        let bytes = vec![b'x'; size];
+        fs::write(root.join("changing"), &bytes).unwrap();
+        assert_eq!(
+            reader
+                .read_bytes("changing", size as u64, &control())
+                .unwrap(),
+            bytes
+        );
+        if size != 0 {
+            assert_eq!(
+                reader
+                    .read_bytes("changing", size as u64 - 1, &control())
+                    .unwrap_err()
+                    .code,
+                "FILE_TOO_LARGE"
+            );
+        }
+    }
+}
+
+#[test]
 fn session_bytes_text_bounds_and_errors_match_standalone() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -59,7 +133,7 @@ fn session_bytes_text_bounds_and_errors_match_standalone() {
 
 fn compare_discovery(root: &Path, config: &Config) {
     let c = control();
-    let reference = discover_using(root, config, Some(&c), |_, path| {
+    let reference = discover_using(root, config, Some(&c), true, None, |_, path| {
         read_confined_with_control(root, path, config.repository.max_file_size_bytes, &c)
     })
     .unwrap();
@@ -171,10 +245,190 @@ fn session_cancellation_after_real_chunk_does_not_read_remaining_source() {
     assert_eq!(reader.stats().read_calls, 1);
 }
 
+#[test]
+fn profiled_discovery_matches_plain_and_counts_all_source_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("one.rs"), "fn one() {}\n").unwrap();
+    fs::write(root.join("nested/two.py"), "def two(): pass\n").unwrap();
+    let config = Config::default();
+    compare_discovery(&root, &config);
+    let (inventory, stats) = discover_profiled(&root, &config, &control()).unwrap();
+    assert_eq!(inventory.files.len(), 2);
+    assert_eq!(stats.reader.bytes_read, 28);
+    assert_eq!(stats.reader.file_opens, 2);
+    assert_eq!(stats.reader.root_opens, 1);
+    assert_eq!(stats.reader.canonicalizations, 1);
+    if cfg!(unix) {
+        assert_eq!(stats.entry_canonicalizations, 0);
+        assert_eq!(stats.descriptor_paths, 2);
+        assert_eq!(stats.reader.root_checks, 5);
+        assert_eq!(stats.reader.leaf_checks, 2);
+    }
+    let c = control();
+    c.cancel();
+    assert_eq!(
+        discover_profiled(&root, &config, &c).err().unwrap().code,
+        "CANCELLED"
+    );
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn descriptor_discovery_keeps_exact_alias_order_filters_utf8_and_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested/z.rs"), "fn z() {}\n").unwrap();
+        fs::write(root.join("\u{e9}.py"), "# \u{e9}\n").unwrap();
+        fs::write(root.join(".hidden.rs"), "fn hidden() {}\n").unwrap();
+        fs::write(root.join("nul.rs"), [0]).unwrap();
+        fs::write(root.join("invalid.rs"), [0xff]).unwrap();
+        symlink("nested/z.rs", root.join("a.rs")).unwrap();
+        symlink("nested", root.join("alias-dir")).unwrap();
+        symlink(outside.path(), root.join("escape")).unwrap();
+        symlink(".", root.join("loop")).unwrap();
+        let mut config = Config::default();
+        for follow in [false, true] {
+            config.repository.follow_symlinks = follow;
+            for hidden in [false, true] {
+                config.repository.include_hidden = hidden;
+                compare_discovery(&root, &config);
+                for max in [0, 1, 4, 100] {
+                    config.repository.max_files = max;
+                    compare_discovery(&root, &config);
+                }
+                for max in [0, 1, 8, u64::MAX] {
+                    config.repository.max_file_size_bytes = max;
+                    compare_discovery(&root, &config);
+                }
+                config.repository.max_file_size_bytes = 2 * 1024 * 1024;
+            }
+            config.repository.include = vec!["*.rs".into(), "nested/**".into()];
+            config.repository.exclude = vec!["invalid.rs".into()];
+            compare_discovery(&root, &config);
+            config.repository.include.clear();
+            config.repository.exclude.clear();
+        }
+    }
+
+    #[test]
+    fn deep_discovery_keeps_two_uncached_descriptor_walks_without_realpath() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = format!("{}source.rs", "d/".repeat(35));
+        fs::create_dir_all(root.join(&path).parent().unwrap()).unwrap();
+        fs::write(root.join(&path), "safe").unwrap();
+        compare_discovery(&root, &Config::default());
+        let (inventory, stats) = discover_profiled(&root, &Config::default(), &control()).unwrap();
+        assert_eq!(inventory.files.len(), 1);
+        assert_eq!(inventory.files[0].path, path);
+        assert_eq!(stats.entry_canonicalizations, 0);
+        assert_eq!(stats.reader.canonicalizations, 1);
+        assert_eq!(stats.reader.parent_opens, 70);
+        assert_eq!(stats.reader.file_opens, 2);
+        assert_eq!(stats.reader.bytes_read, 4);
+    }
+
+    #[test]
+    fn discovery_never_treats_a_regular_leaf_as_parent_confinement_proof() {
+        for cached in [false, true] {
+            for outside_link in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                fs::create_dir(root.join("nested")).unwrap();
+                fs::write(root.join("nested/source.rs"), "safe").unwrap();
+                fs::write(outside.path().join("source.rs"), "secret").unwrap();
+                let c = control();
+                let config = Config::default();
+                let mut reader = ConfinedReader::new(&root).unwrap();
+                if cached {
+                    reader.read("nested/source.rs", 100, &c).unwrap();
+                }
+                let inventory =
+                    discover_using(&root, &config, Some(&c), false, None, |candidate, _| {
+                        fs::rename(root.join("nested"), root.join("saved")).unwrap();
+                        symlink(
+                            if outside_link {
+                                outside.path().to_owned()
+                            } else {
+                                root.join("saved")
+                            },
+                            root.join("nested"),
+                        )
+                        .unwrap();
+                        reader
+                            .read_resolved(candidate, 100, Some(&c))
+                            .and_then(reader::text)
+                    })
+                    .unwrap();
+                assert!(inventory.files.is_empty());
+                assert_eq!(inventory.diagnostics.len(), 1);
+                assert!(inventory.diagnostics[0].contains("PATH_REFUSED"));
+                assert_eq!(reader.stats().bytes_read, if cached { 4 } else { 0 });
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_discovery_refuses_post_read_swaps_and_root_replacement() {
+        for kind in ["leaf", "parent", "root"] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("repo");
+            fs::create_dir_all(root.join("nested")).unwrap();
+            fs::write(root.join("nested/source.rs"), "safe").unwrap();
+            let moved = root.clone();
+            let mut once = true;
+            confined::READ_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    if !once {
+                        return;
+                    }
+                    once = false;
+                    match kind {
+                        "leaf" => {
+                            fs::rename(moved.join("nested/source.rs"), moved.join("saved.rs"))
+                                .unwrap();
+                            symlink("../saved.rs", moved.join("nested/source.rs")).unwrap();
+                        }
+                        "parent" => {
+                            fs::rename(moved.join("nested"), moved.join("saved")).unwrap();
+                            symlink("saved", moved.join("nested")).unwrap();
+                        }
+                        "root" => {
+                            let old = moved.with_extension("old");
+                            fs::rename(&moved, &old).unwrap();
+                            symlink(old, &moved).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let result = discover_profiled(&root, &Config::default(), &control());
+            confined::READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+            if kind == "root" {
+                assert_eq!(result.err().unwrap().code, "PATH_REFUSED");
+            } else {
+                let (inventory, stats) = result.unwrap();
+                assert!(inventory.files.is_empty());
+                assert!(
+                    inventory
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.contains("PATH_REFUSED"))
+                );
+                assert_eq!(stats.reader.bytes_read, 4);
+            }
+        }
+    }
 
     #[test]
     fn parent_reuse_is_real_bounded_and_does_not_impose_private_cache_policy() {

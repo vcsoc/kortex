@@ -9,7 +9,27 @@ import unittest
 from unittest.mock import patch
 import subprocess
 
-from linux_validation import JOURNEY, SCRIPT, container, local_endpoint, mount, pinned_snapshot, source_inputs, test_evidence
+from linux_validation import ANALYSIS_PROOF, JOURNEY, SCRIPT, container, local_endpoint, main as validation_main, mount, pinned_snapshot, require_cache_provenance, source_inputs, test_evidence
+
+
+class CacheProvenanceTests(unittest.TestCase):
+    def test_seed_refuses_before_source_reads_or_docker_calls(self):
+        arguments = ["linux_validation.py", "--snapshot", "/never-read", "--expected-source-sha256", "0" * 64,
+                     "--expected-source-files", "1", "--seed-cache", "/never-read-seed"]
+        with patch("sys.argv", arguments), patch("linux_validation.subprocess.check_output") as execute:
+            with self.assertRaisesRegex(ValueError, "imported Cargo targets"):
+                validation_main()
+        execute.assert_not_called()
+        self.assertNotIn("/old", SCRIPT)
+        self.assertNotIn("cp -a", SCRIPT)
+
+    def test_resume_requires_explicit_unseeded_provenance(self):
+        require_cache_provenance(None)
+        require_cache_provenance(None, {"cache_provenance": "unseeded-v1"})
+        for state in ({}, {"cache_provenance": None}, {"cache_provenance": "seeded"},
+                      {"cache_provenance": True}):
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, "lacks unseeded provenance"):
+                require_cache_provenance(None, state)
 
 
 class SourceSnapshotTests(unittest.TestCase):
@@ -96,7 +116,10 @@ class EvidenceTests(unittest.TestCase):
         return ("VALIDATION_PHASE=workspace BEGIN\ntest result: ok. 12 passed; 0 failed; 1 ignored;\n"
                 "VALIDATION_PHASE=workspace EXIT=0\nVALIDATION_PHASE=journey BEGIN\n"
                 + languages + f"\ntest {JOURNEY} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n"
-                "VALIDATION_PHASE=journey EXIT=0\n")
+                "VALIDATION_PHASE=journey EXIT=0\n"
+                "VALIDATION_PHASE=analysis-proof BEGIN\nactual CLI BLAKE3 abc /build/debug/kortex\n"
+                f"test {ANALYSIS_PROOF} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n"
+                "VALIDATION_PHASE=analysis-proof EXIT=0\n")
 
     def test_actual_test_and_all_six_languages_required(self):
         evidence = test_evidence(self.success())
@@ -105,6 +128,15 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(evidence["six_language_cli_journey_passed"])
         self.assertFalse(test_evidence(self.success().replace("language=php", "language=notphp"))
                          ["six_language_cli_journey_passed"])
+
+    def test_analysis_proof_requires_exact_executed_test_and_binary_identity(self):
+        self.assertTrue(test_evidence(self.success())["analysis_lazy_cli_proof_passed"])
+        for text in (self.success().replace(f"test {ANALYSIS_PROOF} ... ok", "test unrelated ... ok"),
+                     self.success().replace("actual CLI BLAKE3 ", "missing binary identity "),
+                     self.success().replace("1 passed;", "0 passed;"),
+                     self.success().replace("analysis-proof EXIT=0", "analysis-proof EXIT=101"),
+                     self.success().replace("analysis-proof EXIT=0", "")):
+            self.assertFalse(test_evidence(text)["analysis_lazy_cli_proof_passed"])
 
     def test_failed_target_counts_and_nested_helper_are_not_double_counted(self):
         text = ("VALIDATION_PHASE=workspace BEGIN\nRunning tests/helper.rs\n"
@@ -150,19 +182,47 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("--workspace --all-features --locked --offline --no-fail-fast", SCRIPT)
         self.assertIn("-- --ignored --exact --nocapture", SCRIPT)
         self.assertIn("KORTEX_TEST_CLI=/build/debug/kortex", SCRIPT)
+        self.assertIn(ANALYSIS_PROOF + " -- --ignored --exact --nocapture", SCRIPT)
+        self.assertIn("cargo build --workspace --all-features --locked --offline", SCRIPT)
+        self.assertIn("cargo test --workspace --lib --all-features --locked --offline", SCRIPT)
         self.assertNotIn("cargo install", SCRIPT)
 
 
 class ContainerLifecycleTests(unittest.TestCase):
+    def test_writable_or_unverified_root_is_refused_before_start(self):
+        for inspection in ({}, {"HostConfig": {}},
+                           {"HostConfig": {"ReadonlyRootfs": False}},
+                           {"HostConfig": {"ReadonlyRootfs": 1}}):
+            with self.subTest(inspection=inspection), tempfile.TemporaryDirectory() as directory:
+                with patch("linux_validation.subprocess.check_output", side_effect=[b"id", json.dumps([inspection]).encode()]):
+                    with patch("linux_validation.subprocess.run") as execute:
+                        with self.assertRaisesRegex(ValueError, "not verified read-only"):
+                            container(["docker"], Path(directory), "owner", "own-container", [], "true", 60)
+                self.assertEqual(execute.call_count, 1)
+                self.assertEqual(execute.call_args.args[0], ["docker", "rm", "--force", "own-container"])
+                self.assertTrue((Path(directory) / "own-container-inspect.json").is_file())
+
+    def test_bootstrap_readonly_root_has_only_explicit_chown_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            replies = [b"id", json.dumps([{"HostConfig": {"ReadonlyRootfs": True}}]).encode(),
+                       json.dumps([{"State": {"ExitCode": 0}}]).encode()]
+            with patch("linux_validation.subprocess.check_output", side_effect=replies) as output:
+                with patch("linux_validation.subprocess.run", return_value=subprocess.CompletedProcess([], 0)):
+                    self.assertEqual(container(["docker"], Path(directory), "owner", "own-bootstrap", [], "true", 60, root=True), 0)
+            command = output.call_args_list[0].args[0]
+            for flag in ("--read-only", "--cap-drop=ALL", "--cap-add=CHOWN", "--user=0:0"):
+                self.assertIn(flag, command)
+            self.assertEqual(sum(arg.startswith("--cap-add=") for arg in command), 1)
+
     def test_timeout_cleanup_and_offline_nonroot_resource_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
-            with patch("linux_validation.subprocess.check_output", side_effect=[b"id", json.dumps([{}]).encode()]) as output:
+            with patch("linux_validation.subprocess.check_output", side_effect=[b"id", json.dumps([{"HostConfig": {"ReadonlyRootfs": True}}]).encode()]) as output:
                 with patch("linux_validation.subprocess.run", side_effect=[subprocess.TimeoutExpired("docker start", 90), subprocess.CompletedProcess([], 0)]) as execute:
                     with self.assertRaises(subprocess.TimeoutExpired):
                         container(["docker", "--host", "unix:///trusted.sock"], run, "owner-token", "own-container", [], "true", 60)
             command = output.call_args_list[0].args[0]
-            for flag in ("--pull=never", "--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user=501:20", "--cpus=4", "--memory=8g", "--memory-swap=8g", "--pids-limit=1024"):
+            for flag in ("--pull=never", "--read-only", "--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user=501:20", "--cpus=4", "--memory=8g", "--memory-swap=8g", "--pids-limit=1024"):
                 self.assertIn(flag, command)
             self.assertNotIn("--cap-add=CHOWN", command)
             self.assertIn("timeout", command)

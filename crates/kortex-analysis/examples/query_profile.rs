@@ -30,6 +30,7 @@ fn main() {
     let cli = std::env::var_os("KORTEX_TEST_CLI").map(std::path::PathBuf::from);
     let cli_blake3 = cli.as_ref().map(|path| hash(std::fs::read(path).unwrap()));
     let executable_blake3 = hash(std::fs::read(std::env::current_exe().unwrap()).unwrap());
+    let profile_source_blake3 = hash(include_bytes!("query_profile.rs"));
     let temp = tempfile::tempdir().unwrap();
     let mut dataset = String::new();
     for i in 0..files {
@@ -48,7 +49,7 @@ fn main() {
     let report = kortex_indexer::index_at_root(temp.path(), &config, &Default::default()).unwrap();
     println!(
         "{}",
-        json!({"diagnostic_only":true,"phase":"index","ms":ms(begin),"files":files,"functions":files*functions,"symbols":report.snapshot.symbols().count(),"edges":report.snapshot.edges.len(),"dataset_blake3":hash(dataset),"edges_blake3":hash(serde_json::to_vec(&report.snapshot.edges).unwrap()),"parser":kortex_core::PARSER_VERSION,"samples":samples,"cli":cli,"cli_blake3":cli_blake3,"profile_executable_blake3":executable_blake3})
+        json!({"diagnostic_only":true,"phase":"index","ms":ms(begin),"files":files,"functions":files*functions,"symbols":report.snapshot.symbols().count(),"edges":report.snapshot.edges.len(),"dataset_blake3":hash(dataset),"edges_blake3":hash(serde_json::to_vec(&report.snapshot.edges).unwrap()),"parser":kortex_core::PARSER_VERSION,"samples":samples,"cli":cli,"cli_blake3":cli_blake3,"profile_executable_blake3":executable_blake3,"profile_source_blake3":profile_source_blake3})
     );
     drop(report);
     let queries = ["f0", "F0", "m00000.py", "next_call", "missing_term"];
@@ -64,18 +65,25 @@ fn main() {
         let metadata_ms = ms(begin);
         let begin = Instant::now();
         assert_eq!(
-            session.read_projection_source().unwrap(),
+            session.query_scope_source().unwrap(),
             kortex_storage::MetadataSource::Projection
         );
         let projection_validation_ms = ms(begin);
         let begin = Instant::now();
-        let inventory = session.file_inventory_snapshot_order().unwrap();
+        let inventory = session.query_file_inventory_snapshot_order().unwrap();
         let file_inventory_ms = ms(begin);
         drop(inventory);
         let begin = Instant::now();
         let inventory = session.symbol_inventory().unwrap();
         let symbol_inventory_ms = ms(begin);
         drop(inventory);
+        let begin = Instant::now();
+        let candidates = session
+            .query_scoped_candidate_inventory_with_control(text, &Default::default(), &control)
+            .unwrap();
+        let candidate_inventory_ms = ms(begin);
+        let candidate_count = candidates.items.len();
+        drop(candidates);
         let begin = Instant::now();
         let fts = session.keyword(text, 500).unwrap();
         let fts500_ms = ms(begin);
@@ -104,9 +112,7 @@ fn main() {
         let begin = Instant::now();
         let lazy = ReadService::open_at_root(temp.path(), config.clone()).unwrap();
         let lazy_open_ms = ms(begin);
-        let begin = Instant::now();
-        assert_eq!(lazy.freshness().unwrap(), "fresh");
-        let freshness_ms = ms(begin);
+        // No priming before the first complete execution: include projection validation.
         let begin = Instant::now();
         let lazy_response = lazy.execute("query", &request).unwrap();
         let lazy_execute_with_freshness_ms = ms(begin);
@@ -115,6 +121,21 @@ fn main() {
         let eager_response = eager.execute("query", &request).unwrap();
         let eager_execute_with_freshness_ms = ms(begin);
         assert_eq!(stable(lazy_response.clone()), stable(eager_response));
+        let begin = Instant::now();
+        let retry_response = lazy.execute("query", &request).unwrap();
+        let retry_execute_with_freshness_ms = ms(begin);
+        assert_eq!(stable(retry_response), stable(lazy_response.clone()));
+        let smaller_request = json!({"text":text,"limit":7,"require_fresh":true});
+        let begin = Instant::now();
+        let smaller_response = lazy.execute("query", &smaller_request).unwrap();
+        let smaller_retry_with_freshness_ms = ms(begin);
+        assert_eq!(
+            stable(smaller_response),
+            stable(eager.execute("query", &smaller_request).unwrap())
+        );
+        let begin = Instant::now();
+        assert_eq!(lazy.freshness().unwrap(), "fresh");
+        let freshness_ms = ms(begin);
         let cli_process_ms = cli.as_ref().map(|binary| {
             let begin = Instant::now();
             #[cfg(target_os = "macos")]
@@ -149,7 +170,7 @@ fn main() {
         });
         println!(
             "{}",
-            json!({"diagnostic_only":true,"sample":sample,"text":text,"store_open_ms":store_open_ms,"metadata_ms":metadata_ms,"projection_validation_ms":projection_validation_ms,"file_inventory_ms":file_inventory_ms,"symbol_inventory_ms":symbol_inventory_ms,"fts500_ms":fts500_ms,"projected_retrieval_without_freshness_ms":projected_retrieval_ms,"eager_open_ms":eager_open_ms,"eager_retrieval_without_freshness_ms":eager_retrieval_ms,"lazy_open_ms":lazy_open_ms,"freshness_ms":freshness_ms,"lazy_execute_with_freshness_ms":lazy_execute_with_freshness_ms,"eager_execute_with_freshness_ms":eager_execute_with_freshness_ms,"cli_process":cli_process_ms,"query_eager_materialized":lazy.eager_materialized()})
+            json!({"diagnostic_only":true,"projection_scope":"query_required_evidence_only","sample":sample,"text":text,"store_open_ms":store_open_ms,"metadata_ms":metadata_ms,"projection_validation_ms":projection_validation_ms,"file_inventory_ms":file_inventory_ms,"symbol_inventory_ms":symbol_inventory_ms,"candidate_inventory_ms":candidate_inventory_ms,"candidate_count":candidate_count,"fts500_ms":fts500_ms,"projected_retrieval_without_freshness_ms":projected_retrieval_ms,"eager_open_ms":eager_open_ms,"eager_retrieval_without_freshness_ms":eager_retrieval_ms,"lazy_open_ms":lazy_open_ms,"freshness_ms":freshness_ms,"lazy_execute_with_freshness_ms":lazy_execute_with_freshness_ms,"retry_execute_with_freshness_ms":retry_execute_with_freshness_ms,"smaller_retry_with_freshness_ms":smaller_retry_with_freshness_ms,"eager_execute_with_freshness_ms":eager_execute_with_freshness_ms,"cli_process":cli_process_ms,"query_eager_materialized":lazy.eager_materialized()})
         );
     }
     println!(

@@ -1,7 +1,8 @@
 //! Independent grammar-specific P1 extraction. No regex provider or execution of build inputs.
-use super::{span, text};
-use kortex_core::{Import, ParsedFile, Reference, Symbol, hash, id};
+use super::{Sink, span, text};
+use kortex_core::{Import, Reference, Result, Symbol, hash, id};
 use serde_json::json;
+use std::borrow::Cow;
 use tree_sitter::Node;
 
 pub(super) fn supports(lang: &str) -> bool {
@@ -14,9 +15,9 @@ pub(super) fn extract(
     root: Node<'_>,
     source: &str,
     repo: &str,
-    file: &mut ParsedFile,
+    file: &mut Sink,
     owner: &str,
-) {
+) -> Result<()> {
     let mut namespace = String::new();
     // Java package and file-scoped C#/PHP namespaces affect sibling declarations.
     let mut c = root.walk();
@@ -35,12 +36,16 @@ pub(super) fn extract(
             namespace = canonical(text(name, source));
         }
     }
-    file.symbols[0].attributes["namespace"] = json!(namespace);
-    file.symbols[0].attributes["provider"] = json!(format!("tree-sitter-{}-v1", file.language));
+    file.attribute(0, "namespace", json!(namespace))?;
+    file.attribute(
+        0,
+        "provider",
+        json!(format!("tree-sitter-{}-v1", file.language)),
+    )?;
     if matches!(file.language.as_str(), "c" | "cpp") {
-        file.diagnostics.push(format!("{}: preprocessing/compilation database not executed; conditional declarations and linkage remain conservative",file.path));
+        file.diagnostic(format!("{}: preprocessing/compilation database not executed; conditional declarations and linkage remain conservative",file.path))?;
     }
-    visit(root, source, repo, file, owner, &namespace, 0, false);
+    visit(root, source, repo, file, owner, &namespace, 0, false)
 }
 fn declaration<'a>(n: Node<'a>, lang: &str) -> Option<(&'static str, Node<'a>)> {
     let kind = match (lang, n.kind()) {
@@ -115,11 +120,11 @@ fn add(
     kind: &str,
     source: &str,
     repo: &str,
-    file: &mut ParsedFile,
+    file: &mut Sink,
     owner: &str,
     prefix: &str,
     conditional: bool,
-) -> String {
+) -> Result<String> {
     let name_text = canonical(text(name, source));
     let qualified = if prefix.is_empty() {
         name_text.clone()
@@ -142,37 +147,30 @@ fn add(
         .take(2048)
         .collect::<String>();
     let mut c = n.walk();
-    let modifiers: Vec<_> = n
+    let mut static_method = n.kind() == "singleton_method";
+    let (mut private, mut protected, mut public, mut override_marker) =
+        (false, false, false, false);
+    for modifier in n
         .named_children(&mut c)
         .filter(|n| n.kind().contains("modifier") || n.kind() == "storage_class_specifier")
-        .map(|n| text(n, source))
-        .collect();
-    let static_method = n.kind() == "singleton_method"
-        || modifiers
-            .iter()
-            .any(|s| s.split_whitespace().any(|w| w == "static"));
-    let visibility = if modifiers
-        .iter()
-        .any(|s| s.split_whitespace().any(|w| w == "private"))
     {
+        for word in text(modifier, source).split_whitespace() {
+            static_method |= word == "static";
+            private |= word == "private";
+            protected |= word == "protected";
+            public |= word == "public";
+            override_marker |= matches!(word, "override" | "@Override");
+        }
+    }
+    let visibility = if private {
         "private"
-    } else if modifiers
-        .iter()
-        .any(|s| s.split_whitespace().any(|w| w == "protected"))
-    {
+    } else if protected {
         "protected"
-    } else if modifiers
-        .iter()
-        .any(|s| s.split_whitespace().any(|w| w == "public"))
-    {
+    } else if public {
         "public"
     } else {
         "unknown"
     };
-    let override_marker = modifiers.iter().any(|m| {
-        m.split_whitespace()
-            .any(|w| w == "override" || w == "@Override")
-    });
     let parameter = n.kind().contains("parameter");
     let scope = super::semantic::declaration_scope(n, &file.language);
     let declared_type = n
@@ -181,65 +179,68 @@ fn add(
     let previous = n
         .prev_named_sibling()
         .filter(|n| n.kind().contains("comment"));
-    file.symbols.push(Symbol {
+    file.symbol(Symbol {
         symbol_revision_id:id(&[&symbol_id,&hash(text(n,source))]),symbol_id:symbol_id.clone(),repo_id:repo.into(),kind:kind.into(),language:file.language.clone(),name:name_text.rsplit("::").next().unwrap_or("").into(),qualified_name:qualified,file_path:file.path.clone(),span:span(n),signature,
         visibility:visibility.into(),attributes:json!({"name_start":name.start_byte(),"name_end":name.end_byte(),"syntax_error":n.has_error(),"conditional":conditional,"static":static_method,"override":override_marker,"scope_start":scope.start_byte(),"scope_end":scope.end_byte(),"binding":kind=="variable","parameter":parameter,"declared_type":declared_type,"declaration_only": n.child_by_field_name("body").is_none() && matches!(kind,"method"|"function"|"constructor"),"source_snippet":text(n,source).chars().take(512).collect::<String>()}),content_hash:hash(text(n,source)),doc_comment:previous.map(|n|text(n,source).chars().take(4096).collect()),owner_id:Some(owner.into()),
-    });
-    symbol_id
+    })?;
+    Ok(symbol_id)
 }
 fn import(
-    file: &mut ParsedFile,
+    file: &mut Sink,
     n: Node<'_>,
     owner: &str,
     local: String,
     module: String,
     imported: &str,
-) {
-    file.imports.push(Import {
-        local,
-        module,
-        imported: imported.into(),
-    });
-    file.import_scopes.push(owner.into());
-    file.import_spans.push(span(n));
+) -> Result<()> {
+    file.import(
+        Import {
+            local,
+            module,
+            imported: imported.into(),
+        },
+        owner.into(),
+        span(n),
+    )
 }
-fn reference(file: &mut ParsedFile, n: Node<'_>, owner: &str, full: &str, kind: &str) {
+fn reference(file: &mut Sink, n: Node<'_>, owner: &str, full: &str, kind: &str) -> Result<()> {
     let full = canonical(full);
     if full.contains(['(', ')', '[', ']', ' ', '\n', '<', '>']) || full.is_empty() {
-        return;
+        return Ok(());
     }
     let (q, name) = full
         .rsplit_once("::")
         .map(|(q, name)| (Some(q.to_owned()), name))
         .unwrap_or((None, &full));
-    file.references.push(Reference {
+    file.reference(Reference {
         source_id: owner.into(),
         name: name.into(),
         qualifier: q,
         span: span(n),
         kind: kind.into(),
-    });
+    })
 }
 #[allow(clippy::too_many_arguments)]
 fn visit(
     n: Node<'_>,
     source: &str,
     repo: &str,
-    file: &mut ParsedFile,
+    file: &mut Sink,
     owner: &str,
     prefix: &str,
     depth: usize,
     conditional: bool,
-) {
+) -> Result<()> {
+    file.checkpoint()?;
     if depth > 256 {
         if !file
             .diagnostics
             .iter()
             .any(|d| d == "AST depth limit reached")
         {
-            file.diagnostics.push("AST depth limit reached".into());
+            file.extraction_limit("AST depth limit reached")?;
         }
-        return;
+        return Ok(());
     }
     let conditional = conditional
         || matches!(
@@ -247,7 +248,7 @@ fn visit(
             "preproc_if" | "preproc_ifdef" | "preproc_elif" | "preproc_else"
         );
     let mut current = owner.to_owned();
-    let mut qualified = prefix.to_owned();
+    let mut qualified = Cow::Borrowed(prefix);
     if let Some((kind, name)) = declaration(n, &file.language) {
         current = add(
             n,
@@ -259,8 +260,8 @@ fn visit(
             owner,
             prefix,
             conditional,
-        );
-        qualified = file.symbols.last().unwrap().qualified_name.clone();
+        )?;
+        qualified = Cow::Owned(file.symbols.last().unwrap().qualified_name.clone());
     }
     if matches!(
         n.kind(),
@@ -283,22 +284,16 @@ fn visit(
             &current,
             &qualified,
             conditional,
-        );
+        )?;
     }
     match (file.language.as_str(), n.kind()) {
         ("c" | "cpp", "preproc_def" | "preproc_function_def" | "preproc_undef") => {
             if let Some(name) = n.child_by_field_name("name")
-                && let Some(s) = file.symbols.iter_mut().find(|s| s.kind == "file")
+                && let Some(i) = file.symbols.iter().position(|s| s.kind == "file")
             {
-                if !s.attributes["macro_bindings"].is_array() {
-                    s.attributes["macro_bindings"] = json!([]);
-                }
-                s.attributes["macro_bindings"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!(text(name, source)));
+                file.append_attribute(i, "macro_bindings", json!(text(name, source)))?;
             }
-            return;
+            return Ok(());
         }
         ("java", "import_declaration") => {
             let mut c = n.walk();
@@ -319,9 +314,9 @@ fn visit(
                     if star { String::new() } else { local },
                     module,
                     "*",
-                );
+                )?;
             }
-            return;
+            return Ok(());
         }
         ("csharp", "using_directive") => {
             let mut c = n.walk();
@@ -331,9 +326,9 @@ fn visit(
                     .child_by_field_name("name")
                     .map(|n| text(n, source).to_owned())
                     .unwrap_or_default();
-                import(file, n, owner, alias, canonical(text(name, source)), "*");
+                import(file, n, owner, alias, canonical(text(name, source)), "*")?;
             }
-            return;
+            return Ok(());
         }
         ("c" | "cpp", "preproc_include") => {
             if let Some(path) = n
@@ -347,15 +342,15 @@ fn visit(
                     String::new(),
                     super::unquote(text(path, source)),
                     "*",
-                );
+                )?;
             } else {
-                file.diagnostics.push(format!(
+                file.diagnostic(format!(
                     "{}:{}: non-local or dynamic include unresolved",
                     file.path,
                     n.start_position().row + 1
-                ));
+                ))?;
             }
-            return;
+            return Ok(());
         }
         ("php", "namespace_use_clause") => {
             let mut c = n.walk();
@@ -368,9 +363,9 @@ fn visit(
                     .child_by_field_name("alias")
                     .map(|n| text(n, source))
                     .unwrap_or_else(|| module.rsplit("::").next().unwrap_or(""));
-                import(file, n, owner, local.into(), module.clone(), "*");
+                import(file, n, owner, local.into(), module.clone(), "*")?;
             }
-            return;
+            return Ok(());
         }
         ("java", "method_invocation") => {
             if let Some(name) = n.child_by_field_name("name") {
@@ -378,7 +373,7 @@ fn visit(
                 let full = object
                     .map(|q| format!("{q}::{}", text(name, source)))
                     .unwrap_or_else(|| text(name, source).into());
-                reference(file, n, &current, &full, "CALLS");
+                reference(file, n, &current, &full, "CALLS")?;
                 if n.child_by_field_name("object").is_some_and(|q| {
                     q.kind() == "identifier"
                         && text(q, source)
@@ -387,7 +382,7 @@ fn visit(
                             .is_some_and(char::is_lowercase)
                         && text(q, source) != "this"
                 }) {
-                    mark_dynamic(file, &current, n);
+                    mark_dynamic(file, &current, n)?;
                 }
             }
         }
@@ -396,9 +391,9 @@ fn visit(
         | ("php", "function_call_expression") => {
             if let Some(callee) = n.child_by_field_name("function") {
                 let full = text(callee, source);
-                reference(file, n, &current, full, "CALLS");
+                reference(file, n, &current, full, "CALLS")?;
                 if matches!(callee.kind(), "field_expression" | "pointer_expression") {
-                    mark_dynamic(file, &current, n);
+                    mark_dynamic(file, &current, n)?;
                 }
             }
         }
@@ -414,14 +409,14 @@ fn visit(
                 let q = text(receiver, source);
                 // Preserve the call site even when the dynamic PHP receiver is unknown.
                 let full = format!("{}::{}", q.trim_start_matches('$'), text(name, source));
-                reference(file, n, &current, &full, "CALLS");
+                reference(file, n, &current, &full, "CALLS")?;
                 if n.kind() != "scoped_call_expression"
                     || !matches!(
                         receiver.kind(),
                         "name" | "qualified_name" | "relative_scope"
                     )
                 {
-                    mark_dynamic(file, &current, n);
+                    mark_dynamic(file, &current, n)?;
                 }
             }
         }
@@ -442,13 +437,13 @@ fn visit(
                                 String::new(),
                                 super::unquote(text(arg, source)),
                                 "*",
-                            );
+                            )?;
                         } else {
-                            file.diagnostics.push(format!(
+                            file.diagnostic(format!(
                                 "{}:{}: require load-path resolution unsupported",
                                 file.path,
                                 n.start_position().row + 1
-                            ));
+                            ))?;
                         }
                     }
                 } else {
@@ -456,11 +451,11 @@ fn visit(
                     let full = receiver
                         .map(|q| format!("{}::{name}", text(q, source)))
                         .unwrap_or_else(|| name.into());
-                    reference(file, n, &current, &full, "CALLS");
+                    reference(file, n, &current, &full, "CALLS")?;
                     if receiver
                         .is_some_and(|q| !matches!(q.kind(), "constant" | "scope_resolution"))
                     {
-                        mark_dynamic(file, &current, n);
+                        mark_dynamic(file, &current, n)?;
                     }
                 }
             }
@@ -482,6 +477,7 @@ fn visit(
             };
             let mut pending = vec![n];
             while let Some(base) = pending.pop() {
+                file.checkpoint()?;
                 if matches!(
                     base.kind(),
                     "type_identifier"
@@ -491,7 +487,7 @@ fn visit(
                         | "qualified_identifier"
                         | "scope_resolution"
                 ) {
-                    reference(file, base, &current, text(base, source), kind);
+                    reference(file, base, &current, text(base, source), kind)?;
                 } else {
                     let mut c = base.walk();
                     for child in base.named_children(&mut c) {
@@ -504,15 +500,9 @@ fn visit(
     }
     if n.kind() == "type_parameter"
         && let Some(name) = n.child_by_field_name("name").or_else(|| n.named_child(0))
-        && let Some(s) = file.symbols.iter_mut().find(|s| s.symbol_id == current)
+        && let Some(i) = file.symbols.iter().position(|s| s.symbol_id == current)
     {
-        if !s.attributes["type_bindings"].is_array() {
-            s.attributes["type_bindings"] = json!([]);
-        }
-        s.attributes["type_bindings"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(text(name, source)));
+        file.append_attribute(i, "type_bindings", json!(text(name, source)))?;
     }
     if matches!(file.language.as_str(), "ruby" | "php")
         && n.kind() == "assignment"
@@ -534,7 +524,7 @@ fn visit(
             &current,
             &qualified,
             conditional,
-        );
+        )?;
     }
     if file.language == "ruby" && n.kind() == "method_parameters" {
         let mut c = n.walk();
@@ -552,10 +542,10 @@ fn visit(
                 &current,
                 &qualified,
                 conditional,
-            );
+            )?;
         }
     }
-    value_reference(n, source, file, &current);
+    value_reference(n, source, file, &current)?;
     // Explicit named types only; declarations, import names and aggregate fragments are excluded.
     if matches!(
         n.kind(),
@@ -585,14 +575,14 @@ fn visit(
             ancestor = p.parent();
         }
         if !blocked {
-            reference(file, n, &current, text(n, source), "USES_TYPE");
+            reference(file, n, &current, text(n, source), "USES_TYPE")?;
         }
     }
     if matches!(
         n.kind(),
         "package_declaration" | "file_scoped_namespace_declaration" | "using_directive"
     ) {
-        return;
+        return Ok(());
     }
     let mut c = n.walk();
     for child in n.named_children(&mut c) {
@@ -602,14 +592,14 @@ fn visit(
                     && child.kind() == "namespace_definition"
                     && child.child_by_field_name("body").is_none()));
         if file_namespace {
-            visit(child, source, repo, file, owner, "", depth + 1, conditional);
+            visit(child, source, repo, file, owner, "", depth + 1, conditional)?;
             if let Some(ns) = file
                 .symbols
                 .iter()
                 .find(|s| s.kind == "namespace" && s.span.start_byte == child.start_byte())
             {
                 current = ns.symbol_id.clone();
-                qualified = ns.qualified_name.clone();
+                qualified = Cow::Owned(ns.qualified_name.clone());
             }
         } else {
             visit(
@@ -621,11 +611,12 @@ fn visit(
                 &qualified,
                 depth + 1,
                 conditional,
-            );
+            )?;
         }
     }
+    Ok(())
 }
-fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str) {
+fn value_reference(n: Node<'_>, source: &str, file: &mut Sink, owner: &str) -> Result<()> {
     if !matches!(
         n.kind(),
         "identifier"
@@ -639,13 +630,13 @@ fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str
             | "field_expression"
             | "scope_resolution"
     ) {
-        return;
+        return Ok(());
     }
     if file.symbols.iter().any(|s| {
         s.attributes["name_start"].as_u64() == Some(n.start_byte() as u64)
             && s.attributes["name_end"].as_u64() == Some(n.end_byte() as u64)
     }) {
-        return;
+        return Ok(());
     }
     let mut child = n;
     let mut ancestor = n.parent();
@@ -668,7 +659,7 @@ fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str
                 | "base_class_clause"
                 | "type_parameter"
         ) {
-            return;
+            return Ok(());
         }
         if matches!(
             p.kind(),
@@ -682,7 +673,7 @@ fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str
                 | "named_type"
                 | "type_identifier"
         ) {
-            return;
+            return Ok(());
         }
         if p.child_by_field_name("name") == Some(child)
             && matches!(
@@ -698,7 +689,7 @@ fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str
                     | "parameter"
             )
         {
-            return;
+            return Ok(());
         }
         if matches!(
             p.kind(),
@@ -716,7 +707,7 @@ fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str
             || p.child_by_field_name("method") == Some(child)
             || p.child_by_field_name("scope") == Some(child))
         {
-            return;
+            return Ok(());
         }
         if p.child_by_field_name("type") == Some(child)
             || p.child_by_field_name("returns") == Some(child)
@@ -732,16 +723,11 @@ fn value_reference(n: Node<'_>, source: &str, file: &mut ParsedFile, owner: &str
         child = p;
         ancestor = p.parent();
     }
-    reference(file, n, owner, text(n, source), kind);
+    reference(file, n, owner, text(n, source), kind)
 }
-fn mark_dynamic(file: &mut ParsedFile, owner: &str, n: Node<'_>) {
-    if let Some(s) = file.symbols.iter_mut().find(|s| s.symbol_id == owner) {
-        if !s.attributes["dynamic_sites"].is_array() {
-            s.attributes["dynamic_sites"] = json!([]);
-        }
-        s.attributes["dynamic_sites"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(n.start_byte()));
+fn mark_dynamic(file: &mut Sink, owner: &str, n: Node<'_>) -> Result<()> {
+    if let Some(i) = file.symbols.iter().position(|s| s.symbol_id == owner) {
+        file.append_attribute(i, "dynamic_sites", json!(n.start_byte()))?;
     }
+    Ok(())
 }

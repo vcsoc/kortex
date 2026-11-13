@@ -49,10 +49,27 @@ impl ResolutionContext {
         Ok(self)
     }
 }
+/// Trusted compatibility oracle; no aggregate resource policy is enforced.
 pub fn resolve_with_context(
     snapshot: &Snapshot,
     context: &ResolutionContext,
 ) -> Vec<kortex_core::Edge> {
+    resolve_context_impl(snapshot, context, None)
+        .expect("unbounded resolution has no admission failures")
+}
+pub fn resolve_bounded_with_context(
+    snapshot: &Snapshot,
+    context: &ResolutionContext,
+    limits: &super::ResolutionLimits,
+) -> Result<Vec<kortex_core::Edge>> {
+    resolve_context_impl(snapshot, context, Some(limits))
+}
+fn resolve_context_impl(
+    snapshot: &Snapshot,
+    context: &ResolutionContext,
+    limits: Option<&super::ResolutionLimits>,
+) -> Result<Vec<kortex_core::Edge>> {
+    let mut budget = super::bounds::Budget::new(limits);
     // No transformed semantic input means the original immutable facts are sufficient.
     // This avoids cloning the entire graph for Python/Rust/Go/P1 and plain relative JS imports.
     if (context.ts_paths.is_empty() && context.ts_base_url.is_none())
@@ -61,9 +78,33 @@ pub fn resolve_with_context(
             .iter()
             .any(|f| matches!(f.language.as_str(), "javascript" | "typescript"))
     {
-        return super::resolve(snapshot, context.go_module.as_deref());
+        return super::resolve_impl(snapshot, context.go_module.as_deref(), &mut budget);
     }
-    let mut facts = snapshot.clone();
+    let mut fact_bytes = 0usize;
+    if let Some(limits) = limits {
+        for file in &snapshot.files {
+            let mut size = super::bounds::Counter::default();
+            serde_json::to_writer(&mut size, file)?;
+            fact_bytes = super::bounds::reserve(
+                "alias workspace JSON bytes",
+                fact_bytes,
+                size.0,
+                limits.max_fact_bytes,
+            )?;
+        }
+    }
+    // Resolution reads only repo_id and immutable parse facts, never previous resolved edges.
+    let mut facts = Snapshot {
+        repo_id: snapshot.repo_id.clone(),
+        files: snapshot.files.clone(),
+        ..Default::default()
+    };
+    let mut import_count = snapshot
+        .files
+        .iter()
+        .filter(|f| !matches!(f.language.as_str(), "javascript" | "typescript"))
+        .map(|f| f.imports.len())
+        .sum::<usize>();
     for file in &mut facts.files {
         if !matches!(file.language.as_str(), "javascript" | "typescript") {
             continue;
@@ -107,6 +148,49 @@ pub fn resolve_with_context(
                 targets.push(import.module.clone());
             }
             for target in targets {
+                if let Some(limits) = limits {
+                    import_count = super::bounds::reserve(
+                        "transformed imports",
+                        import_count,
+                        1,
+                        limits.max_imports,
+                    )?;
+                    let mut size = super::bounds::Counter::default();
+                    // Substitute borrowed module JSON in the original import's exact size.
+                    serde_json::to_writer(&mut size, import)?;
+                    let mut old_module = super::bounds::Counter::default();
+                    serde_json::to_writer(&mut old_module, &import.module)?;
+                    size.0 -= old_module.0;
+                    serde_json::to_writer(&mut size, &target)?;
+                    serde_json::to_writer(
+                        &mut size,
+                        file.import_scopes
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or(""),
+                    )?;
+                    serde_json::to_writer(
+                        &mut size,
+                        file.import_spans.get(index).unwrap_or(&Default::default()),
+                    )?;
+                    let prefix = if target != import.module {
+                        2 + up.len()
+                    } else {
+                        0
+                    };
+                    let payload = super::bounds::reserve(
+                        "alias workspace JSON bytes",
+                        size.0,
+                        prefix + 3, // conservatively reserve a comma in each output array
+                        limits.max_fact_bytes,
+                    )?;
+                    fact_bytes = super::bounds::reserve(
+                        "alias workspace JSON bytes",
+                        fact_bytes,
+                        payload,
+                        limits.max_fact_bytes,
+                    )?;
+                }
                 let mut mapped = import.clone();
                 if target != import.module {
                     mapped.module = format!("./{up}{target}");
@@ -120,7 +204,7 @@ pub fn resolve_with_context(
         file.import_scopes = scopes;
         file.import_spans = spans;
     }
-    super::resolve(&facts, context.go_module.as_deref())
+    super::resolve_impl(&facts, context.go_module.as_deref(), &mut budget)
 }
 // JSONC comments/trailing commas are handled with a string-aware scanner, not regular expressions.
 fn jsonc(source: &str) -> String {
