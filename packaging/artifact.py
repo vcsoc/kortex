@@ -49,7 +49,7 @@ files = {"kortex.exe" if os.name == "nt" else "kortex": binary.read_bytes(),
 license_path = project / "LICENSE"
 files[license_path.name] = license_path.read_bytes()
 for path in sorted((project / "docs").iterdir()):
-    if path.is_file() and path.suffix in (".md", ".json", ".txt"):
+    if path.is_file() and (path.suffix in (".md", ".json", ".txt") or path.name == "QUICKSTART.html"):
         files[f"docs/{path.name}"] = path.read_bytes()
 files.update(collect_notices(metadata, project, include_frontend=args.web_assets is not None,
                             frontend_root=args.frontend_dependencies))

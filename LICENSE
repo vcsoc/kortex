@@ -1,18 +1,35 @@
-PROPRIETARY AND CONFIDENTIAL
+KORTEX SOURCE-AVAILABLE LICENSE
 
-All rights reserved.
+Copyright (c) Kortex's owner. All rights reserved except as expressly granted below.
 
-Kortex and its first-party source code, documentation, assets, and build artifacts
-are private and closed source. No license or permission is granted to any other
-person or entity to access, use, copy, modify, distribute, publish, sublicense,
-sell, or otherwise exploit these materials.
+1. Permission. The owner grants you a worldwide, non-exclusive, royalty-free
+permission to use, reproduce, modify, and distribute Kortex and your modifications,
+subject to the restrictions below. You must include this license with any copy or
+substantial portion you distribute. This license applies only to first-party Kortex
+materials for which the owner has authority to grant these permissions.
 
-Only activities expressly authorized by the project owner are permitted. This
-restriction remains in effect until the project owner explicitly changes it.
-Possession of a copy, repository access, or the existence of a build artifact does
-not grant any rights or permission.
+2. Restricted sales and sold products. Without the owner's prior written approval,
+signed by the owner or an authorized representative, you may not:
 
-Third-party components remain subject to their respective licenses and notices.
-This notice does not replace or restrict rights granted by those third parties in
-their own materials, and those licenses do not grant rights in Kortex's
-first-party materials.
+   a. sell, resell, license for a fee, rent, or otherwise distribute Kortex or a
+      modified version of Kortex for monetary or other valuable consideration; or
+   b. incorporate Kortex into, make it available as part of, or use it to provide
+      a product or service that is sold or licensed for a fee, including a hosted
+      service or subscription.
+
+These restrictions apply whether Kortex is distributed separately or bundled with
+other materials. Using Kortex as an internal development tool in an organization
+that sells other products or services is permitted, provided Kortex is not itself
+incorporated into, made available as part of, or used to provide a sold product or
+service as described above. A separate written agreement signed by the owner or an
+authorized representative may grant additional permissions.
+
+3. Reservation of rights. No rights are granted except those expressly stated.
+This license does not grant rights to the owner's trademarks. Third-party
+components remain governed by their own applicable licenses and notices.
+
+4. Disclaimer. KORTEX IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW,
+THE OWNER AND CONTRIBUTORS ARE NOT LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH KORTEX OR ITS USE.

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kortex quick start</title><style>body{font:1rem/1.6 system-ui,sans-serif;max-width:50rem;margin:3rem auto;padding:0 1rem;color:#182b27}pre{background:#172b27;color:#f1f7ec;padding:1rem;overflow:auto}code{font-family:monospace}aside{border-left:4px solid #ba6239;padding:.3rem 1rem;background:#fff3e5}</style></head><body>
+<h1>Kortex quick start</h1>
+<aside><strong>Private development software.</strong> Full production acceptance is open. The default ignore-policy loader has a known confinement issue; do not use this build on untrusted repositories.</aside>
+<p>Kortex builds a local, source-derived index. Treat the index as sensitive, and verify its findings against source and tests.</p>
+<h2>1. Initialize a trusted project</h2><pre><code>kortex init /path/to/project</code></pre>
+<p>This may create project configuration and an AGENTS.md section and may build an index. It does not configure an MCP client.</p>
+<h2>2. Search and inspect</h2><pre><code>kortex --repo /path/to/project query authentication
+kortex --repo /path/to/project context path/to/file.rs:Symbol
+kortex --repo /path/to/project impact path/to/file.rs:Symbol</code></pre>
+<p>Replace the example paths and symbols with real ones. See <code>kortex --help</code> and each command's <code>--help</code> for current options.</p>
+<h2>3. Connect an agent</h2><p>In a supported agent's MCP settings, explicitly add the installed Kortex executable with argument <code>mcp</code>. Consult that agent's own configuration documentation. Kortex does not automatically modify agent settings.</p>
+<p>This page works offline. No remote scripts, fonts, analytics, models or services are loaded.</p>
+</body></html>
